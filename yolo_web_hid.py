@@ -11,16 +11,34 @@ from flask import Flask, Response
 from queue import Queue
 
 # 配置参数
-MODEL_PATH = './Models/best-rk3588.rknn'
+MODEL_PATH = './Models/cf-11s-rk3588.rknn'
 CONF_THRES = 0.7
 IOU_THRES = 0.4
 CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
 TARGET_CLASS_ID = 0
 ENABLE_HID = True # 是否启用HID控制
-HID_MOVE_COOLDOWN = 0.2 # HID移动冷却时间(秒)
+HID_MOVE_COOLDOWN = 0.0001 # HID移动冷却时间(秒) - 降低冷却时间以获得更平滑的移动
 HID_DEVICE = '/dev/hidg1'
-HID_TX_PATH = '/home/pi/YOLO11n/HID/hidtx'
+MOUSE_SENSITIVITY = 0.8 # 鼠标灵敏度系数
+
+# 自动射击配置
+AUTO_SHOOT = False # 是否启用自动射击
+SHOOT_COOLDOWN = 0.2 # 射击冷却时间 (秒)
+SHOOT_THRESHOLD = 15 # 射击触发范围 (像素距离)
+SHOOT_DURATION = 0.02 # 点击持续时间 (秒)
+
+# 准星偏移校准 (如果摄像头没有完全对准屏幕中心，调整这里)
+AIM_OFFSET_X = 5 # 正数向右偏移，负数向左偏移
+AIM_OFFSET_Y = 0 # 正数向下偏移，负数向上偏移
+AIM_DEADZONE = 20 # 瞄准死区 (像素)，目标在此范围内不进行移动
+AIM_HEIGHT_RATIO = 0.10 # 瞄准高度比例 (0.0=头顶, 0.5=中心, 1.0=脚底)
+
+# PID 控制参数
+PID_KP = 0.65  # 提高P值，追求"一次到位"的快速响应
+PID_KI = 0.0   # 禁用I值，FPS场景下积分项容易导致滞后和震荡
+PID_KD = 0.40  # 提高D值，提供强力刹车，抵消高P值带来的过冲风险
+PID_MAX_INTEGRAL = 0 # 积分限幅
 
 app = Flask(__name__)
 
@@ -28,7 +46,28 @@ app = Flask(__name__)
 model_wrapper = None
 output_frame = None
 last_hid_move_time = 0
+last_shoot_time = 0
+hid_file = None # HID设备文件句柄
+pid_state = {
+    'last_error_x': 0,
+    'last_error_y': 0,
+    'integral_x': 0,
+    'integral_y': 0
+}
+frame_id = 0
 lock = threading.Lock()
+
+# 初始化HID设备
+try:
+    # 尝试给予当前用户写权限
+    subprocess.run(['sudo', 'chmod', '666', HID_DEVICE], check=False)
+    # 使用 buffering=0 (无缓冲) 模式打开，提高写入速度
+    hid_file = open(HID_DEVICE, 'wb', buffering=0)
+    print(f"Successfully opened HID device: {HID_DEVICE}")
+except Exception as e:
+    print(f"Failed to open HID device: {e}")
+    print("HID control will be disabled.")
+    ENABLE_HID = False
 
 COCO_CLASSES = [
     'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat','traffic light',
@@ -425,8 +464,25 @@ class YOLO_CPU_Wrapper:
         else:
             return np.zeros((0, 6))
 
+def trigger_click():
+    global hid_file
+    if not hid_file: return
+    try:
+        # Press Left Button (0x01)
+        hid_file.write(bytearray([0x01, 0, 0, 0]))
+        # hid_file.flush() # Not needed with buffering=0
+        
+        # Short delay for click registration
+        time.sleep(SHOOT_DURATION)
+        
+        # Release
+        hid_file.write(bytearray([0, 0, 0, 0]))
+        # hid_file.flush()
+    except Exception as e:
+        print(f"Click error: {e}")
+
 def process_frame_result(frame, dets, center_x, center_y):
-    global output_frame, last_hid_move_time
+    global output_frame, last_hid_move_time, pid_state, last_shoot_time
     
     # Find target closest to center
     target = None
@@ -435,7 +491,10 @@ def process_frame_result(frame, dets, center_x, center_y):
     for det in dets:
         if int(det[5]) == TARGET_CLASS_ID:
             x1, y1, x2, y2 = det[:4]
-            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            cx = (x1 + x2) / 2
+            # 计算瞄准点高度 (默认0.25即头部位置)
+            cy = y1 + (y2 - y1) * AIM_HEIGHT_RATIO
+            
             dist = (cx - center_x)**2 + (cy - center_y)**2
             if dist < min_dist:
                 min_dist = dist
@@ -443,18 +502,64 @@ def process_frame_result(frame, dets, center_x, center_y):
     
     if target:
         cx, cy = target
-        dx = cx - center_x
-        dy = cy - center_y
+        raw_dx = cx - center_x
+        raw_dy = cy - center_y
+        
+        # Auto Shoot Logic
+        current_time = time.time()
+        if AUTO_SHOOT and ENABLE_HID and hid_file:
+            # Check if target is within shooting threshold
+            if abs(raw_dx) < SHOOT_THRESHOLD and abs(raw_dy) < SHOOT_THRESHOLD:
+                if current_time - last_shoot_time > SHOOT_COOLDOWN:
+                    # Trigger click in a separate thread to avoid blocking main loop
+                    threading.Thread(target=trigger_click).start()
+                    last_shoot_time = current_time
+
+        # Apply Deadzone
+        if abs(raw_dx) < AIM_DEADZONE: raw_dx = 0
+        if abs(raw_dy) < AIM_DEADZONE: raw_dy = 0
+
+        # PID Calculation
+        # X Axis
+        derivative_x = raw_dx - pid_state['last_error_x']
+        move_x = (PID_KP * raw_dx) + (PID_KD * derivative_x)
+        pid_state['last_error_x'] = raw_dx
+
+        # Y Axis
+        derivative_y = raw_dy - pid_state['last_error_y']
+        move_y = (PID_KP * raw_dy) + (PID_KD * derivative_y)
+        pid_state['last_error_y'] = raw_dy
+
+        dx = int(move_x)
+        dy = int(move_y)
         
         # Deadzone and sensitivity
-        current_time = time.time()
-        if ENABLE_HID and (abs(dx) >= 2 or abs(dy) >= 2) and (current_time - last_hid_move_time > HID_MOVE_COOLDOWN):
+        if ENABLE_HID and hid_file and (abs(dx) >= 1 or abs(dy) >= 1) and (current_time - last_hid_move_time > HID_MOVE_COOLDOWN):
             try:
-                if os.path.exists(HID_TX_PATH):
-                    subprocess.run(['sudo', HID_TX_PATH, HID_DEVICE, str(int(dx)), str(int(dy))], check=False)
+                # 应用灵敏度系数
+                final_dx = int(dx * MOUSE_SENSITIVITY)
+                final_dy = int(dy * MOUSE_SENSITIVITY)
+                
+                # 限制单次移动最大值 (HID报告限制为 -127 到 127)
+                final_dx = max(-127, min(127, final_dx))
+                final_dy = max(-127, min(127, final_dy))
+                
+                if final_dx != 0 or final_dy != 0:
+                    # 构建HID报告: [buttons, x, y, wheel]
+                    # x, y 需要转换为有符号字节
+                    buf = bytearray([0, final_dx & 0xFF, final_dy & 0xFF, 0])
+                    hid_file.write(buf)
+                    # hid_file.flush() # Not needed with buffering=0
                     last_hid_move_time = current_time
-            except Exception:
+            except Exception as e:
+                print(f"HID Write Error: {e}")
                 pass
+    else:
+        # Reset PID integral when no target found to prevent windup
+        pid_state['integral_x'] = 0
+        pid_state['integral_y'] = 0
+        pid_state['last_error_x'] = 0
+        pid_state['last_error_y'] = 0
     
     vis = draw_detections(frame.copy(), dets)
     # Draw crosshair
@@ -480,7 +585,8 @@ def detection_loop():
 
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    center_x, center_y = actual_width / 2, actual_height / 2
+    center_x = (actual_width / 2) + AIM_OFFSET_X
+    center_y = (actual_height / 2) + AIM_OFFSET_Y
     
     # print(f"Camera resolution: {actual_width}x{actual_height}")
 

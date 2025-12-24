@@ -1,83 +1,138 @@
-# YOLO Web Streamer for RK3588
+# YOLO11n RK3588 AI 助手
 
-这是一个基于 Flask 和 OpenCV 的 YOLO 目标检测 Web 推流项目，专为 Rockchip RK3588 平台（如 NanoPC-T6）优化。它支持使用 RKNN NPU 加速推理，并包含 HID 模拟功能（用于自动瞄准/控制）。
+这是一个专为 Rockchip RK3588 平台（如 NanoPC-T6）打造的高性能 YOLO 目标检测与自动辅助系统。项目利用 RK3588 强大的 NPU 进行 3 核心并行推理，实现高帧率的目标检测，并通过 USB HID 接口模拟鼠标进行智能辅助操作。
 
-## 功能特性
+## ✨ 主要功能
 
-*   **Web 视频流**: 通过浏览器实时查看检测结果（访问 `http://<IP>:5000`）。
-*   **多 NPU 加速**: 针对 RK3588 的 3 个 NPU 核心进行并行推理，显著提升 FPS。
-*   **多模型支持**: 
-    *   支持 `.rknn` 模型（使用 `rknnlite2` 进行 NPU 加速）。
-    *   支持 `.pt` 模型（使用 `ultralytics` 进行 CPU 推理，仅用于调试）。
-*   **HID 控制**: 检测到目标后，通过 USB HID 接口模拟鼠标移动（需要硬件支持及 `hidtx` 工具）。
-*   **自动模型尺寸探测**: 自动识别 RKNN 模型的输入分辨率。
+*   **🚀 极致性能**: 利用 RK3588 的 3 个 NPU 核心进行多线程并行推理，大幅提升 FPS。
+*   **👁️ 实时监控**: 内置 Flask Web 服务器，通过浏览器实时查看低延迟的检测画面 (MJPEG 流)。
+*   **🎯 智能瞄准**: 
+    *   集成 **PID 控制算法**，实现平滑、精准的鼠标移动，拒绝机械式卡顿。
+    *   支持 **动态死区** 和 **灵敏度调节**。
+*   **🔥 自动射击**: 当准星锁定目标时，自动触发鼠标左键点击（支持冷却时间配置）。
+*   **⚡ 高效传输**: 
+    *   直接操作 `/dev/hidg1` 设备文件，无缓冲写入，延迟极低。
+    *   优化了 Web 视频流编码，降低 CPU 占用。
+*   **🛠️ 广泛兼容**: 支持 YOLOv5, YOLOv8, YOLOv10, YOLOv11 的 RKNN 模型。
 
-## 环境要求
+## 🛠️ 硬件与环境要求
 
-*   **硬件**: Rockchip RK3588 开发板 (例如 NanoPC-T6)。
-*   **操作系统**: Linux (Ubuntu/Debian)。
-*   **Python 环境**: 建议使用 Conda 环境 (例如 `rknn`)。
+*   **开发板**: Rockchip RK3588 系列 (推荐 NanoPC-T6, Orange Pi 5 等)。
+*   **摄像头**: USB 摄像头 (支持 MJPEG 格式更佳)。
+*   **连接**: 开发板 OTG 接口需连接到目标主机（PC/游戏机）以模拟鼠标。
+*   **系统**: Linux (Ubuntu/Debian/Armbian)。
+*   **Python**: Python 3.8+ (建议使用 Conda 环境)。
 
-### 依赖库
+## 📦 安装依赖
 
-请确保安装了以下 Python 库：
+建议在 Conda 环境中运行：
 
 ```bash
+# 激活环境
+conda activate rknn
+
+# 安装基础依赖
 pip install flask opencv-python numpy
-# 如果使用 RKNN 模型
-pip install rknn-toolkit-lite2
-# 如果使用 PT 模型
+
+# 安装 RKNN Lite2 (用于 NPU 推理)
+# 请从 Rockchip 官方仓库下载对应 Python 版本的 whl 包安装
+pip install rknn_toolkit_lite2-*.whl
+
+# (可选) 如果需要调试 .pt 模型
 pip install ultralytics
 ```
 
-## 文件结构
+## ⚙️ USB HID 配置 (关键)
 
-*   `simple_yolo_web.py`: 主程序脚本。
-*   `check_model.py`: 模型检查工具。
-*   `hidtx`: HID 发送工具（二进制文件）。
-*   `Models/`: 存放模型文件的目录（需自行创建或修改路径）。
+本项目依赖 Linux USB Gadget API 来模拟鼠标。在运行程序前，必须确保 `/dev/hidg1` 设备存在。
 
-## 快速开始
+如果你的系统中没有该设备，请创建一个启动脚本 `hid_setup.sh` 并以 root 权限运行：
+
+```bash
+#!/bin/bash
+# 配置 USB Gadget 为鼠标设备
+
+CONFIGFS_HOME=/sys/kernel/config/usb_gadget
+GADGET_NAME=rknn_mouse
+LANG=0x409
+
+modprobe libcomposite
+
+mkdir -p ${CONFIGFS_HOME}/${GADGET_NAME}
+cd ${CONFIGFS_HOME}/${GADGET_NAME}
+
+echo 0x1d6b > idVendor  # Linux Foundation
+echo 0x0104 > idProduct # Multifunction Composite Gadget
+echo 0x0100 > bcdDevice
+echo 0x0200 > bcdUSB
+
+mkdir -p strings/${LANG}
+echo "RKNN-AI" > strings/${LANG}/manufacturer
+echo "AI-Mouse" > strings/${LANG}/product
+echo "12345678" > strings/${LANG}/serialnumber
+
+# 配置 HID 功能
+mkdir -p functions/hid.usb0
+echo 1 > functions/hid.usb0/protocol
+echo 1 > functions/hid.usb0/subclass
+echo 8 > functions/hid.usb0/report_length
+# 写入鼠标报告描述符
+echo -ne \\x05\\x01\\x09\\x02\\xa1\\x01\\x09\\x01\\xa1\\x00\\x05\\x09\\x19\\x01\\x29\\x03\\x15\\x00\\x25\\x01\\x95\\x03\\x75\\x01\\x81\\x02\\x95\\x01\\x75\\x05\\x81\\x03\\x05\\x01\\x09\\x30\\x09\\x31\\x09\\x38\\x15\\x81\\x25\\x7f\\x75\\x08\\x95\\x03\\x81\\x06\\xc0\\xc0 > functions/hid.usb0/report_desc
+
+mkdir -p configs/c.1/strings/${LANG}
+echo "Config 1" > configs/c.1/strings/${LANG}/configuration
+echo 250 > configs/c.1/MaxPower
+
+# 关联功能
+ln -s functions/hid.usb0 configs/c.1/
+
+# 启用 Gadget (请根据实际 UDC 名称修改，通常是 fc000000.usb 或类似)
+ls /sys/class/udc > UDC
+chmod 777 /dev/hidg0 2>/dev/null || true
+chmod 777 /dev/hidg1 2>/dev/null || true
+```
+
+## 🚀 运行项目
 
 1.  **准备模型**:
-    确保你的 `.rknn` 模型文件路径正确。默认路径在脚本中配置为 `./Models/yolo11n-rk3588.rknn`。
+    将转换好的 `.rknn` 模型放入 `Models/` 目录。
+    修改 `yolo_web_hid.py` 中的 `MODEL_PATH` 变量指向你的模型。
 
-2.  **运行程序**:
-    使用配置好 RKNN 环境的 Python 解释器运行脚本：
+2.  **启动脚本**:
 
     ```bash
-    # 假设你的环境名为 rknn
-    /home/pi/anaconda3/envs/rknn/bin/python simple_yolo_web.py
-    ```
-    或者直接：
-    ```bash
-    python3 simple_yolo_web.py
+    # 建议使用 sudo 以确保有权限访问 /dev/hidg1 和 摄像头
+    sudo /home/pi/anaconda3/envs/rknn/bin/python yolo_web_hid.py
     ```
 
 3.  **访问 Web 界面**:
-    在浏览器中输入开发板的 IP 地址和端口 5000，例如：
-    `http://192.168.x.x:5000`
+    在浏览器中访问: `http://<开发板IP>:5000`
 
-## 配置说明
+## 🔧 参数调优
 
-可以在 `simple_yolo_web.py` 开头部分修改配置参数：
+在 `yolo_web_hid.py` 顶部可以调整核心参数：
 
 ```python
-MODEL_PATH = './Models/yolo11n-rk3588.rknn'  # 模型路径
-CONF_THRES = 0.45                            # 置信度阈值
-IOU_THRES = 0.2                              # NMS IOU 阈值
-CAMERA_INDEXES = [20, 21, 11, 0]             # 摄像头索引尝试列表
-TARGET_CLASS_ID = 0                          # 目标类别 ID (0 通常是 person)
-HID_DEVICE = '/dev/hidg1'                    # HID 设备节点
+# 核心配置
+CONF_THRES = 0.7         # 置信度阈值
+TARGET_CLASS_ID = 0      # 目标类别 ID (0 通常是人)
+ENABLE_HID = True        # 总开关
+
+# 瞄准参数
+AIM_OFFSET_X = 5         # 准星横向偏移校准
+AIM_HEIGHT_RATIO = 0.10  # 瞄准高度 (0.0=头顶, 0.5=中心)
+MOUSE_SENSITIVITY = 0.8  # 鼠标移动灵敏度
+
+# 自动射击
+AUTO_SHOOT = True        # 启用自动射击
+SHOOT_THRESHOLD = 15     # 触发范围 (像素)
+SHOOT_COOLDOWN = 0.2     # 射击冷却 (秒)
+
+# PID 控制 (平滑移动)
+PID_KP = 0.65            # 比例系数 (响应速度)
+PID_KD = 0.40            # 微分系数 (阻尼/防抖)
 ```
 
-## 注意事项
+## ⚠️ 免责声明
 
-*   **HID 权限**: 使用 HID 功能通常需要 `sudo` 权限，或者配置相应的 udev 规则。脚本中尝试使用 `sudo` 调用 `hidtx`。
-*   **摄像头**: 脚本会按顺序尝试 `CAMERA_INDEXES` 中的索引直到找到可用摄像头。
-*   **性能**: 使用 `.rknn` 模型时，脚本会自动启动 3 个线程利用 RK3588 的 3 个 NPU 核心。
-
-## 常见问题
-
-*   **报错 `rknnlite package not found`**: 请检查是否在正确的 Conda/Python 环境中运行。
-*   **画面卡顿**: 检查网络连接，或者尝试降低摄像头分辨率。
+本项目仅供计算机视觉与嵌入式系统学习研究使用。请勿用于任何违反游戏公平性或法律法规的用途。作者不对使用本项目造成的任何后果负责。
