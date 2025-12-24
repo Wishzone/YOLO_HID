@@ -8,14 +8,15 @@ import threading
 import os
 import sys
 from flask import Flask, Response
+from queue import Queue
 
 # 配置参数
-MODEL_PATH = './Models/yolo11s-rk3588.rknn'
+MODEL_PATH = './Models/yolo11n-rk3588.rknn'
 CONF_THRES = 0.45
 IOU_THRES = 0.2
 CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
-TARGET_CLASS_ID = 0
+TARGET_CLASS_ID = 1
 HID_DEVICE = '/dev/hidg1'
 HID_TX_PATH = '/home/pi/YOLO11n/HID/hidtx'
 
@@ -340,6 +341,59 @@ class YOLO_RKNN_Wrapper:
             
         return dets
 
+class MultiYOLO_RKNN_Wrapper:
+    def __init__(self, model_path, num_threads=3):
+        self.wrappers = []
+        # Load first one to probe size
+        print(f"Loading NPU model 1/{num_threads}...")
+        w1 = YOLO_RKNN_Wrapper(model_path)
+        self.wrappers.append(w1)
+        self.model_wh = w1.model_wh
+        
+        for i in range(num_threads - 1):
+            print(f"Loading NPU model {i+2}/{num_threads}...")
+            w = YOLO_RKNN_Wrapper(model_path)
+            # Ensure all wrappers use the same size (avoid re-probing if possible, 
+            # though YOLO_RKNN_Wrapper currently probes in __init__. 
+            # We could optimize this but for now it's fine as it only happens on startup)
+            self.wrappers.append(w)
+            
+        self.input_queue = Queue(maxsize=num_threads + 2)
+        self.output_queue = Queue()
+        self.running = True
+        self.threads = []
+        
+    def start(self):
+        for i, wrapper in enumerate(self.wrappers):
+            t = threading.Thread(target=self._worker, args=(wrapper,))
+            t.daemon = True
+            t.start()
+            self.threads.append(t)
+            
+    def _worker(self, wrapper):
+        while self.running:
+            try:
+                item = self.input_queue.get(timeout=0.1)
+            except:
+                continue
+                
+            frame = item
+            # Detect
+            try:
+                dets = wrapper.detect(frame)
+                self.output_queue.put((frame, dets))
+            except Exception as e:
+                print(f"Inference error: {e}")
+            
+    def detect_async(self, frame):
+        if not self.input_queue.full():
+            self.input_queue.put(frame)
+            
+    def get_result(self):
+        if not self.output_queue.empty():
+            return self.output_queue.get()
+        return None, None
+
 class YOLO_CPU_Wrapper:
     def __init__(self, model_path):
         from ultralytics import YOLO
@@ -363,6 +417,42 @@ class YOLO_CPU_Wrapper:
         else:
             return np.zeros((0, 6))
 
+def process_frame_result(frame, dets, center_x, center_y):
+    global output_frame
+    
+    # Find target closest to center
+    target = None
+    min_dist = float('inf')
+    
+    for det in dets:
+        if int(det[5]) == TARGET_CLASS_ID:
+            x1, y1, x2, y2 = det[:4]
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            dist = (cx - center_x)**2 + (cy - center_y)**2
+            if dist < min_dist:
+                min_dist = dist
+                target = (cx, cy)
+    
+    if target:
+        cx, cy = target
+        dx = cx - center_x
+        dy = cy - center_y
+        
+        # Deadzone and sensitivity
+        if abs(dx) >= 2 or abs(dy) >= 2:
+            try:
+                if os.path.exists(HID_TX_PATH):
+                    subprocess.run(['sudo', HID_TX_PATH, HID_DEVICE, str(int(dx)), str(int(dy))], check=False)
+            except Exception:
+                pass
+    
+    vis = draw_detections(frame.copy(), dets)
+    # Draw crosshair
+    cv2.line(vis, (int(center_x)-10, int(center_y)), (int(center_x)+10, int(center_y)), (0,255,255), 1)
+    cv2.line(vis, (int(center_x), int(center_y)-10), (int(center_x), int(center_y)+10), (0,255,255), 1)
+    
+    return vis
+
 def detection_loop():
     global output_frame, model_wrapper
     cap = None
@@ -384,6 +474,10 @@ def detection_loop():
     
     # print(f"Camera resolution: {actual_width}x{actual_height}")
 
+    # Start async wrapper if applicable
+    if hasattr(model_wrapper, 'start'):
+        model_wrapper.start()
+
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
@@ -404,55 +498,46 @@ def detection_loop():
                     # print(f"Reshape failed: {e}")
                     continue
         
-        dets = model_wrapper.detect(frame)
+        vis = None
         
-        # Find target closest to center
-        target = None
-        min_dist = float('inf')
-        
-        for det in dets:
-            if int(det[5]) == TARGET_CLASS_ID:
-                x1, y1, x2, y2 = det[:4]
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                dist = (cx - center_x)**2 + (cy - center_y)**2
-                if dist < min_dist:
-                    min_dist = dist
-                    target = (cx, cy)
-        
-        if target:
-            cx, cy = target
-            dx = cx - center_x
-            dy = cy - center_y
+        if hasattr(model_wrapper, 'detect_async'):
+            model_wrapper.detect_async(frame.copy()) # Pass copy to avoid race condition if frame buffer reused
             
-            # Deadzone and sensitivity
-            if abs(dx) >= 2 or abs(dy) >= 2:
-                try:
-                    if os.path.exists(HID_TX_PATH):
-                        subprocess.run(['sudo', HID_TX_PATH, HID_DEVICE, str(int(dx)), str(int(dy))], check=False)
-                except Exception:
-                    pass
+            # Process all available results
+            while True:
+                res_frame, dets = model_wrapper.get_result()
+                if res_frame is None:
+                    break
+                
+                vis = process_frame_result(res_frame, dets, center_x, center_y)
+                
+                # Calculate FPS (based on processed frames)
+                fps_counter += 1
+                if time.time() - fps_start_time >= 1.0:
+                    fps = fps_counter / (time.time() - fps_start_time)
+                    fps_counter = 0
+                    fps_start_time = time.time()
+        else:
+            dets = model_wrapper.detect(frame)
+            vis = process_frame_result(frame, dets, center_x, center_y)
+            
+            # Calculate FPS
+            fps_counter += 1
+            if time.time() - fps_start_time >= 1.0:
+                fps = fps_counter / (time.time() - fps_start_time)
+                fps_counter = 0
+                fps_start_time = time.time()
         
-        vis = draw_detections(frame.copy(), dets)
-        # Draw crosshair
-        cv2.line(vis, (int(center_x)-10, int(center_y)), (int(center_x)+10, int(center_y)), (0,255,255), 1)
-        cv2.line(vis, (int(center_x), int(center_y)-10), (int(center_x), int(center_y)+10), (0,255,255), 1)
-        
-        # Calculate FPS
-        fps_counter += 1
-        if time.time() - fps_start_time >= 1.0:
-            fps = fps_counter / (time.time() - fps_start_time)
-            fps_counter = 0
-            fps_start_time = time.time()
-        
-        cv2.putText(vis, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        if vis is not None:
+            cv2.putText(vis, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # Sanity check
-        if vis.shape[0] > 4000 or vis.shape[1] > 4000:
-            # print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
-            continue
+            # Sanity check
+            if vis.shape[0] > 4000 or vis.shape[1] > 4000:
+                # print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
+                continue
 
-        with lock:
-            output_frame = vis.copy()
+            with lock:
+                output_frame = vis.copy()
 
     cap.release()
 
@@ -508,7 +593,8 @@ def video_feed():
 if __name__ == '__main__':
     # 初始化模型
     if MODEL_PATH.endswith('.rknn'):
-        model_wrapper = YOLO_RKNN_Wrapper(MODEL_PATH)
+        # Use Multi-NPU wrapper for RKNN models
+        model_wrapper = MultiYOLO_RKNN_Wrapper(MODEL_PATH, num_threads=3)
     elif MODEL_PATH.endswith('.pt'):
         model_wrapper = YOLO_CPU_Wrapper(MODEL_PATH)
     else:
