@@ -7,37 +7,44 @@ import subprocess
 import threading
 import os
 import sys
-from flask import Flask, Response
+from flask import Flask, Response, request, jsonify
 from queue import Queue
 
+import atexit
+
 # 配置参数
-MODEL_PATH = './Models/cf-11s-rk3588.rknn'
+MODEL_PATH = './Models/cf-11n-rk3588.rknn'
 CONF_THRES = 0.7
 IOU_THRES = 0.4
 CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
 TARGET_CLASS_ID = 0
 ENABLE_HID = True # 是否启用HID控制
-HID_MOVE_COOLDOWN = 0.0001 # HID移动冷却时间(秒) - 降低冷却时间以获得更平滑的移动
+HID_MOVE_COOLDOWN = 0.0005 # HID移动冷却时间(秒) - 降低冷却时间以获得更平滑的移动
 HID_DEVICE = '/dev/hidg1'
-MOUSE_SENSITIVITY = 0.8 # 鼠标灵敏度系数
+MOUSE_SENSITIVITY = 0.4 # 鼠标灵敏度系数
 
 # 自动射击配置
 AUTO_SHOOT = False # 是否启用自动射击
-SHOOT_COOLDOWN = 0.2 # 射击冷却时间 (秒)
-SHOOT_THRESHOLD = 15 # 射击触发范围 (像素距离)
+SHOOT_COOLDOWN = 0.03 # 射击冷却时间 (秒) - 增加冷却时间以防止卡顿
+SHOOT_THRESHOLD = 30 # 射击触发范围 (像素距离)
 SHOOT_DURATION = 0.02 # 点击持续时间 (秒)
+SHOOT_PREDICTION = 9 # 射击预测 (帧) - 提前多少帧进行射击判定
+SHOOT_SUSTAIN_TIME = 0.15 # 射击信号保持时间 (秒)
+RECOIL_STRENGTH = 3.0 # 压枪力度 (像素/次)
 
 # 准星偏移校准 (如果摄像头没有完全对准屏幕中心，调整这里)
-AIM_OFFSET_X = 5 # 正数向右偏移，负数向左偏移
+AIM_OFFSET_X = 0 # 正数向右偏移，负数向左偏移
 AIM_OFFSET_Y = 0 # 正数向下偏移，负数向上偏移
-AIM_DEADZONE = 20 # 瞄准死区 (像素)，目标在此范围内不进行移动
+AIM_DEADZONE = 0 # 瞄准死区 (像素)，目标在此范围内不进行移动
 AIM_HEIGHT_RATIO = 0.10 # 瞄准高度比例 (0.0=头顶, 0.5=中心, 1.0=脚底)
+HID_SMOOTH_FACTOR = 0.35 # 平滑移动系数 (0.1~1.0)，越小越平滑但越慢
+HID_UPDATE_INTERVAL = 0.003 # HID更新间隔 (秒), 0.002 = 500Hz
 
 # PID 控制参数
-PID_KP = 0.65  # 提高P值，追求"一次到位"的快速响应
-PID_KI = 0.0   # 禁用I值，FPS场景下积分项容易导致滞后和震荡
-PID_KD = 0.40  # 提高D值，提供强力刹车，抵消高P值带来的过冲风险
+PID_KP = 0.30  # 降低P值，防止因延迟导致的过冲震荡
+PID_KI = 0.001   # 禁用I值
+PID_KD = 0.12  # 大幅提高D值，利用微分项预测趋势，提前刹车
 PID_MAX_INTEGRAL = 0 # 积分限幅
 
 app = Flask(__name__)
@@ -46,16 +53,35 @@ app = Flask(__name__)
 model_wrapper = None
 output_frame = None
 last_hid_move_time = 0
-last_shoot_time = 0
+should_shoot = False # 射击控制标志
+last_shoot_signal_time = 0 # 上次触发射击信号的时间
 hid_file = None # HID设备文件句柄
+hid_buffer_x = 0.0
+hid_buffer_y = 0.0
+hid_buttons = 0 # 当前按键状态
+hid_lock = threading.Lock()
 pid_state = {
     'last_error_x': 0,
     'last_error_y': 0,
     'integral_x': 0,
-    'integral_y': 0
+    'integral_y': 0,
+    'tracking_frames': 0
 }
 frame_id = 0
 lock = threading.Lock()
+
+def cleanup():
+    global hid_file
+    print("Cleaning up resources...")
+    if hid_file:
+        try:
+            hid_file.close()
+            print("HID device closed.")
+        except:
+            pass
+    # Stop threads if possible (not strictly necessary as they are daemons)
+
+atexit.register(cleanup)
 
 # 初始化HID设备
 try:
@@ -332,19 +358,21 @@ class YOLO_RKNN_Wrapper:
         from rknnlite.api import RKNNLite
         
         if not os.path.exists(model_path):
-            print(f"Error: Model file {model_path} not found!")
-            sys.exit(1)
+            raise FileNotFoundError(f"Model file {model_path} not found!")
 
         with SilenceAndPrint(verbose=False):
             self.rknn = RKNNLite()
             ret = self.rknn.load_rknn(model_path)
             if ret != 0:
-                print('Load RKNN model failed')
-                sys.exit(ret)
+                raise RuntimeError('Load RKNN model failed')
             self.rknn.init_runtime()
             
         self.model_wh = self._probe_model_size()
         # print(f"--> Detected RKNN model input size: {self.model_wh}")
+
+    def release(self):
+        if hasattr(self, 'rknn'):
+            self.rknn.release()
 
     def _probe_model_size(self):
         # Probe with dummy inputs
@@ -390,20 +418,26 @@ class YOLO_RKNN_Wrapper:
 
 class MultiYOLO_RKNN_Wrapper:
     def __init__(self, model_path, num_threads=3):
-        self.wrappers = []
-        # Load first one to probe size
-        print(f"Loading NPU model 1/{num_threads}...")
-        w1 = YOLO_RKNN_Wrapper(model_path)
-        self.wrappers.append(w1)
-        self.model_wh = w1.model_wh
+        self.model_path = model_path
+        self.num_threads = num_threads
+        self.wrappers = [] # Keep references if needed, but mainly managed in threads
         
-        for i in range(num_threads - 1):
-            print(f"Loading NPU model {i+2}/{num_threads}...")
-            w = YOLO_RKNN_Wrapper(model_path)
-            # Ensure all wrappers use the same size (avoid re-probing if possible, 
-            # though YOLO_RKNN_Wrapper currently probes in __init__. 
-            # We could optimize this but for now it's fine as it only happens on startup)
-            self.wrappers.append(w)
+        # Load one instance temporarily to probe model size
+        print(f"Probing model size with temporary instance...")
+        temp_wrapper = YOLO_RKNN_Wrapper(model_path)
+        self.model_wh = temp_wrapper.model_wh
+        # Explicitly release resources of temp wrapper if possible, 
+        # though Python's GC and RKNNLite's destructor should handle it.
+        # In rknnlite2, we might need to be careful. 
+        # For now, we assume letting it go out of scope is fine, 
+        # or we could keep it as one of the workers.
+        # Let's keep it simple: close it to be safe.
+        if hasattr(temp_wrapper, 'rknn'):
+            try:
+                temp_wrapper.rknn.release()
+            except:
+                pass
+        del temp_wrapper
             
         self.input_queue = Queue(maxsize=num_threads + 2)
         self.output_queue = Queue()
@@ -411,35 +445,51 @@ class MultiYOLO_RKNN_Wrapper:
         self.threads = []
         
     def start(self):
-        for i, wrapper in enumerate(self.wrappers):
-            t = threading.Thread(target=self._worker, args=(wrapper,))
+        for i in range(self.num_threads):
+            t = threading.Thread(target=self._worker, args=(i,))
             t.daemon = True
             t.start()
             self.threads.append(t)
             
-    def _worker(self, wrapper):
+    def _worker(self, thread_id):
+        print(f"Loading NPU model {thread_id+1}/{self.num_threads} in thread...")
+        try:
+            # Initialize RKNN in the worker thread context
+            wrapper = YOLO_RKNN_Wrapper(self.model_path)
+            # Ensure model size matches (it should)
+            if wrapper.model_wh != self.model_wh:
+                print(f"Warning: Model size mismatch in thread {thread_id}")
+        except Exception as e:
+            print(f"Failed to load NPU model in thread {thread_id}: {e}")
+            return
+
         while self.running:
             try:
                 item = self.input_queue.get(timeout=0.1)
             except:
                 continue
                 
-            frame = item
+            frame_id, frame = item
             # Detect
             try:
                 dets = wrapper.detect(frame)
-                self.output_queue.put((frame, dets))
+                self.output_queue.put((frame_id, frame, dets))
             except Exception as e:
-                print(f"Inference error: {e}")
+                print(f"Inference error in thread {thread_id}: {e}")
             
-    def detect_async(self, frame):
-        if not self.input_queue.full():
-            self.input_queue.put(frame)
+    def detect_async(self, frame, frame_id):
+        # Clear queue to ensure we only process the latest frame (LIFO behavior)
+        while not self.input_queue.empty():
+            try:
+                self.input_queue.get_nowait()
+            except:
+                pass
+        self.input_queue.put((frame_id, frame))
             
     def get_result(self):
         if not self.output_queue.empty():
             return self.output_queue.get()
-        return None, None
+        return None, None, None
 
 class YOLO_CPU_Wrapper:
     def __init__(self, model_path):
@@ -464,25 +514,41 @@ class YOLO_CPU_Wrapper:
         else:
             return np.zeros((0, 6))
 
-def trigger_click():
-    global hid_file
-    if not hid_file: return
-    try:
-        # Press Left Button (0x01)
-        hid_file.write(bytearray([0x01, 0, 0, 0]))
-        # hid_file.flush() # Not needed with buffering=0
-        
-        # Short delay for click registration
-        time.sleep(SHOOT_DURATION)
-        
-        # Release
-        hid_file.write(bytearray([0, 0, 0, 0]))
-        # hid_file.flush()
-    except Exception as e:
-        print(f"Click error: {e}")
+def shoot_worker():
+    global should_shoot, hid_buffer_y, hid_buttons
+    while True:
+        if not ENABLE_HID or not hid_file:
+            time.sleep(0.1)
+            continue
+            
+        if should_shoot:
+            try:
+                # Press Left Button (0x01)
+                with hid_lock:
+                    hid_buttons = 0x01
+                    hid_file.write(bytearray([hid_buttons, 0, 0, 0]))
+                    # 压枪：增加 Y 轴向下的偏移量
+                    if RECOIL_STRENGTH > 0:
+                        hid_buffer_y += RECOIL_STRENGTH
+                
+                # Hold
+                time.sleep(SHOOT_DURATION)
+                
+                # Release
+                with hid_lock:
+                    hid_buttons = 0
+                    hid_file.write(bytearray([hid_buttons, 0, 0, 0]))
+                
+                # Cooldown
+                time.sleep(SHOOT_COOLDOWN)
+            except Exception as e:
+                print(f"Shoot error: {e}")
+                time.sleep(0.1)
+        else:
+            time.sleep(0.01)
 
-def process_frame_result(frame, dets, center_x, center_y):
-    global output_frame, last_hid_move_time, pid_state, last_shoot_time
+def process_hid_logic(dets, center_x, center_y):
+    global last_hid_move_time, pid_state, should_shoot, hid_buffer_x, hid_buffer_y, last_shoot_signal_time
     
     # Find target closest to center
     target = None
@@ -505,15 +571,35 @@ def process_frame_result(frame, dets, center_x, center_y):
         raw_dx = cx - center_x
         raw_dy = cy - center_y
         
+        # Calculate derivatives for prediction and PID
+        if pid_state['tracking_frames'] > 0:
+            current_derivative_x = raw_dx - pid_state['last_error_x']
+            current_derivative_y = raw_dy - pid_state['last_error_y']
+        else:
+            current_derivative_x = 0
+            current_derivative_y = 0
+            
+        pid_state['tracking_frames'] += 1
+
         # Auto Shoot Logic
-        current_time = time.time()
-        if AUTO_SHOOT and ENABLE_HID and hid_file:
-            # Check if target is within shooting threshold
-            if abs(raw_dx) < SHOOT_THRESHOLD and abs(raw_dy) < SHOOT_THRESHOLD:
-                if current_time - last_shoot_time > SHOOT_COOLDOWN:
-                    # Trigger click in a separate thread to avoid blocking main loop
-                    threading.Thread(target=trigger_click).start()
-                    last_shoot_time = current_time
+        if AUTO_SHOOT and ENABLE_HID:
+            # Predict position in N frames
+            pred_dx = raw_dx + (current_derivative_x * SHOOT_PREDICTION)
+            pred_dy = raw_dy + (current_derivative_y * SHOOT_PREDICTION)
+            
+            # Check if current OR predicted position is within threshold
+            # Using OR ensures we don't stop shooting if we are already there but derivative is fluctuating
+            if (abs(raw_dx) < SHOOT_THRESHOLD and abs(raw_dy) < SHOOT_THRESHOLD) or \
+               (abs(pred_dx) < SHOOT_THRESHOLD and abs(pred_dy) < SHOOT_THRESHOLD):
+                last_shoot_signal_time = time.time()
+                should_shoot = True
+            else:
+                if time.time() - last_shoot_signal_time < SHOOT_SUSTAIN_TIME:
+                    should_shoot = True
+                else:
+                    should_shoot = False
+        else:
+            should_shoot = False
 
         # Apply Deadzone
         if abs(raw_dx) < AIM_DEADZONE: raw_dx = 0
@@ -521,52 +607,131 @@ def process_frame_result(frame, dets, center_x, center_y):
 
         # PID Calculation
         # X Axis
-        derivative_x = raw_dx - pid_state['last_error_x']
-        move_x = (PID_KP * raw_dx) + (PID_KD * derivative_x)
+        # derivative_x = raw_dx - pid_state['last_error_x'] # Already calculated
+        move_x = (PID_KP * raw_dx) + (PID_KD * current_derivative_x)
         pid_state['last_error_x'] = raw_dx
 
         # Y Axis
-        derivative_y = raw_dy - pid_state['last_error_y']
-        move_y = (PID_KP * raw_dy) + (PID_KD * derivative_y)
+        # derivative_y = raw_dy - pid_state['last_error_y'] # Already calculated
+        move_y = (PID_KP * raw_dy) + (PID_KD * current_derivative_y)
         pid_state['last_error_y'] = raw_dy
 
         dx = int(move_x)
         dy = int(move_y)
         
         # Deadzone and sensitivity
-        if ENABLE_HID and hid_file and (abs(dx) >= 1 or abs(dy) >= 1) and (current_time - last_hid_move_time > HID_MOVE_COOLDOWN):
-            try:
-                # 应用灵敏度系数
-                final_dx = int(dx * MOUSE_SENSITIVITY)
-                final_dy = int(dy * MOUSE_SENSITIVITY)
-                
-                # 限制单次移动最大值 (HID报告限制为 -127 到 127)
-                final_dx = max(-127, min(127, final_dx))
-                final_dy = max(-127, min(127, final_dy))
-                
-                if final_dx != 0 or final_dy != 0:
-                    # 构建HID报告: [buttons, x, y, wheel]
-                    # x, y 需要转换为有符号字节
-                    buf = bytearray([0, final_dx & 0xFF, final_dy & 0xFF, 0])
-                    hid_file.write(buf)
-                    # hid_file.flush() # Not needed with buffering=0
-                    last_hid_move_time = current_time
-            except Exception as e:
-                print(f"HID Write Error: {e}")
-                pass
+        if ENABLE_HID and hid_file and (abs(dx) >= 1 or abs(dy) >= 1):
+            # 应用灵敏度系数
+            final_dx = dx * MOUSE_SENSITIVITY
+            final_dy = dy * MOUSE_SENSITIVITY
+            
+            # 将移动量加入平滑缓冲区
+            with hid_lock:
+                hid_buffer_x += final_dx
+                hid_buffer_y += final_dy
     else:
         # Reset PID integral when no target found to prevent windup
         pid_state['integral_x'] = 0
         pid_state['integral_y'] = 0
         pid_state['last_error_x'] = 0
         pid_state['last_error_y'] = 0
-    
-    vis = draw_detections(frame.copy(), dets)
+        pid_state['tracking_frames'] = 0
+        
+        if AUTO_SHOOT and ENABLE_HID and (time.time() - last_shoot_signal_time < SHOOT_SUSTAIN_TIME):
+             should_shoot = True
+        else:
+             should_shoot = False
+        
+        # Clear HID buffer to prevent drift/jitter when target is lost
+        with hid_lock:
+            hid_buffer_x = 0.0
+            hid_buffer_y = 0.0
+
+def hid_worker():
+    global hid_buffer_x, hid_buffer_y, hid_buttons
+    while True:
+        if not ENABLE_HID or not hid_file:
+            time.sleep(0.1)
+            continue
+            
+        with hid_lock:
+            # Simple Proportional smoothing
+            # Move a fraction of the remaining distance
+            step_x = hid_buffer_x * HID_SMOOTH_FACTOR
+            step_y = hid_buffer_y * HID_SMOOTH_FACTOR
+            
+            # Minimum movement logic to ensure convergence
+            # Only move if buffer has significant value (> 0.5) to prevent jitter
+            if abs(hid_buffer_x) > 0.5 and abs(step_x) < 1:
+                step_x = 1 if hid_buffer_x > 0 else -1
+            elif abs(hid_buffer_x) <= 0.5:
+                step_x = 0
+                
+            if abs(hid_buffer_y) > 0.5 and abs(step_y) < 1:
+                step_y = 1 if hid_buffer_y > 0 else -1
+            elif abs(hid_buffer_y) <= 0.5:
+                step_y = 0
+            
+            # Clamp to max HID report size
+            step_x = max(-127, min(127, step_x))
+            step_y = max(-127, min(127, step_y))
+            
+            # Update buffer
+            # We only subtract what we actually intend to send (integer part)
+            dx = int(step_x)
+            dy = int(step_y)
+            
+            hid_buffer_x -= dx
+            hid_buffer_y -= dy
+            
+            current_buttons = hid_buttons
+        
+        if dx != 0 or dy != 0:
+            try:
+                buf = bytearray([current_buttons, dx & 0xFF, dy & 0xFF, 0])
+                hid_file.write(buf)
+                # hid_file.flush()
+            except Exception:
+                pass
+        
+        time.sleep(HID_UPDATE_INTERVAL)
+
+# --- 异步绘图模块 ---
+vis_queue = Queue(maxsize=2)
+
+def draw_final_frame(frame, dets, center_x, center_y, fps):
+    vis = draw_detections(frame, dets)
     # Draw crosshair
     cv2.line(vis, (int(center_x)-10, int(center_y)), (int(center_x)+10, int(center_y)), (0,255,255), 1)
     cv2.line(vis, (int(center_x), int(center_y)-10), (int(center_x), int(center_y)+10), (0,255,255), 1)
     
+    # Draw Shoot Threshold Circle (Visual Aid)
+    if AUTO_SHOOT:
+        # 画出射击触发范围，方便调试
+        cv2.circle(vis, (int(center_x), int(center_y)), int(SHOOT_THRESHOLD), (0, 255, 255), 1)
+    
+    cv2.putText(vis, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     return vis
+
+def vis_worker():
+    global output_frame
+    while True:
+        try:
+            # 获取最新的绘图任务
+            frame, dets, center_x, center_y, fps = vis_queue.get()
+            
+            # 绘图
+            vis = draw_final_frame(frame, dets, center_x, center_y, fps)
+            
+            # Sanity check
+            if vis.shape[0] > 4000 or vis.shape[1] > 4000:
+                continue
+            
+            # 更新 output_frame
+            with lock:
+                output_frame = vis
+        except Exception as e:
+            print(f"Vis error: {e}")
 
 def detection_loop():
     global output_frame, model_wrapper
@@ -577,6 +742,11 @@ def detection_loop():
         if temp_cap.isOpened():
             # print(f"Opened camera index {idx}")
             cap = temp_cap
+            # 尝试设置缓冲区大小为1，减少摄像头内部延迟
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except:
+                pass
             break
     
     if cap is None or not cap.isOpened():
@@ -597,12 +767,41 @@ def detection_loop():
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
+    
+    frame_id_counter = 0
+    last_processed_frame_id = -1
+    
+    fail_count = 0
 
     while True:
+        if cap is None or not cap.isOpened():
+            print("Camera disconnected, trying to reconnect...")
+            time.sleep(1)
+            for idx in CAMERA_INDEXES:
+                temp_cap = cv2.VideoCapture(idx)
+                if temp_cap.isOpened():
+                    cap = temp_cap
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except:
+                        pass
+                    print(f"Reconnected to camera index {idx}")
+                    break
+            if cap is None or not cap.isOpened():
+                continue
+
         success, frame = cap.read()
         if not success:
-            time.sleep(0.1)
+            fail_count += 1
+            if fail_count > 10:
+                print("Camera read failed, releasing...")
+                cap.release()
+                cap = None
+                fail_count = 0
+            time.sleep(0.01)
             continue
+        
+        fail_count = 0
         
         # 修复某些特定 OpenCV 版本返回扁平化数组的问题
         if frame.ndim == 2 and frame.shape[0] == 1:
@@ -615,27 +814,38 @@ def detection_loop():
                     continue
         
         vis = None
+        frame_id_counter += 1
         
         if hasattr(model_wrapper, 'detect_async'):
-            model_wrapper.detect_async(frame.copy()) # Pass copy to avoid race condition if frame buffer reused
+            model_wrapper.detect_async(frame.copy(), frame_id_counter) # Pass copy to avoid race condition if frame buffer reused
             
             # Process all available results
             while True:
-                res_frame, dets = model_wrapper.get_result()
+                fid, res_frame, dets = model_wrapper.get_result()
                 if res_frame is None:
                     break
                 
-                vis = process_frame_result(res_frame, dets, center_x, center_y)
-                
-                # Calculate FPS (based on processed frames)
-                fps_counter += 1
-                if time.time() - fps_start_time >= 1.0:
-                    fps = fps_counter / (time.time() - fps_start_time)
-                    fps_counter = 0
-                    fps_start_time = time.time()
+                # Only process if newer than last processed frame
+                if fid > last_processed_frame_id:
+                    # 1. HID Control (Critical Path)
+                    process_hid_logic(dets, center_x, center_y)
+                    last_processed_frame_id = fid
+                    
+                    # Calculate FPS (based on processed frames)
+                    fps_counter += 1
+                    if time.time() - fps_start_time >= 1.0:
+                        fps = fps_counter / (time.time() - fps_start_time)
+                        fps_counter = 0
+                        fps_start_time = time.time()
+                    
+                    # 2. Visualization (Async)
+                    if not vis_queue.full():
+                        vis_queue.put((res_frame, dets, center_x, center_y, fps))
+
         else:
             dets = model_wrapper.detect(frame)
-            vis = process_frame_result(frame, dets, center_x, center_y)
+            # 1. HID Control
+            process_hid_logic(dets, center_x, center_y)
             
             # Calculate FPS
             fps_counter += 1
@@ -643,17 +853,12 @@ def detection_loop():
                 fps = fps_counter / (time.time() - fps_start_time)
                 fps_counter = 0
                 fps_start_time = time.time()
+            
+            # 2. Visualization (Async)
+            if not vis_queue.full():
+                vis_queue.put((frame.copy(), dets, center_x, center_y, fps))
         
-        if vis is not None:
-            cv2.putText(vis, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # Sanity check
-            if vis.shape[0] > 4000 or vis.shape[1] > 4000:
-                # print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
-                continue
-
-            with lock:
-                output_frame = vis.copy()
+        # Old visualization logic removed
 
     cap.release()
 
@@ -691,15 +896,215 @@ def index():
     return """
     <html>
       <head>
-        <title>YOLO Web Stream</title>
+        <title>YOLO Web Stream & Config</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #333; color: #fff; }
+            .container { display: flex; flex-wrap: wrap; gap: 20px; }
+            .video-box { flex: 1; min-width: 300px; }
+            .controls { flex: 1; min-width: 300px; background: #444; padding: 20px; border-radius: 8px; }
+            .control-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; }
+            input[type=range] { width: 100%%; }
+            input[type=number] { width: 80px; }
+            .value-display { float: right; font-weight: bold; color: #0f0; }
+            button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #0056b3; }
+        </style>
       </head>
       <body>
-        <h1>YOLO Video Stream</h1>
-        <p>Model: {}</p>
-        <img src="/video_feed" width="100%">
+        <h1>YOLO Control Panel</h1>
+        <div class="container">
+            <div class="video-box">
+                <img src="/video_feed" width="100%%" style="border: 2px solid #666;">
+            </div>
+            <div class="controls">
+                <h2>Configuration</h2>
+                
+                <div class="control-group">
+                    <label>Enable HID <input type="checkbox" id="enable_hid" onchange="updateConfig()"></label>
+                </div>
+
+                <div class="control-group">
+                    <label>Smooth Factor (0.1=Slow, 1.0=Fast) <span id="val_smooth" class="value-display"></span></label>
+                    <input type="range" id="hid_smooth" min="0.05" max="1.0" step="0.05" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>HID Interval (s) <span id="val_interval" class="value-display"></span></label>
+                    <input type="range" id="hid_interval" min="0.001" max="0.02" step="0.001" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Recoil Strength (px/shot) <span id="val_recoil" class="value-display"></span></label>
+                    <input type="range" id="recoil_strength" min="0" max="10" step="0.5" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Shoot Cooldown (s) <span id="val_cooldown" class="value-display"></span></label>
+                    <input type="range" id="shoot_cooldown" min="0.01" max="0.5" step="0.01" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Shoot Threshold (px) <span id="val_thres" class="value-display"></span></label>
+                    <input type="range" id="shoot_thres" min="10" max="200" step="5" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Shoot Prediction (frames) <span id="val_pred" class="value-display"></span></label>
+                    <input type="range" id="shoot_pred" min="0" max="10" step="0.5" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>PID KP (Proportional) <span id="val_kp" class="value-display"></span></label>
+                    <input type="range" id="pid_kp" min="0" max="2.0" step="0.01" oninput="updateConfig()">
+                </div>
+                <div class="control-group">
+                    <label>PID KI (Integral) <span id="val_ki" class="value-display"></span></label>
+                    <input type="range" id="pid_ki" min="0" max="0.1" step="0.001" oninput="updateConfig()">
+                </div>
+                <div class="control-group">
+                    <label>PID KD (Derivative) <span id="val_kd" class="value-display"></span></label>
+                    <input type="range" id="pid_kd" min="0" max="1.0" step="0.01" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Mouse Sensitivity <span id="val_sens" class="value-display"></span></label>
+                    <input type="range" id="mouse_sens" min="0.1" max="2.0" step="0.1" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Aim Deadzone (px) <span id="val_dead" class="value-display"></span></label>
+                    <input type="range" id="aim_dead" min="0" max="20" step="1" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Aim Height Ratio (0=Top, 1=Bottom) <span id="val_ratio" class="value-display"></span></label>
+                    <input type="range" id="aim_ratio" min="0" max="1.0" step="0.05" oninput="updateConfig()">
+                </div>
+
+                <div class="control-group">
+                    <label>Offset X <span id="val_offx" class="value-display"></span></label>
+                    <input type="range" id="aim_offx" min="-50" max="50" step="1" oninput="updateConfig()">
+                </div>
+                <div class="control-group">
+                    <label>Offset Y <span id="val_offy" class="value-display"></span></label>
+                    <input type="range" id="aim_offy" min="-50" max="50" step="1" oninput="updateConfig()">
+                </div>
+            </div>
+        </div>
+
+        <script>
+            // Initial values from server
+            const config = {
+                PID_KP: %s,
+                PID_KI: %s,
+                PID_KD: %s,
+                MOUSE_SENSITIVITY: %s,
+                AIM_DEADZONE: %s,
+                AIM_HEIGHT_RATIO: %s,
+                AIM_OFFSET_X: %s,
+                AIM_OFFSET_Y: %s,
+                HID_SMOOTH_FACTOR: %s,
+                HID_UPDATE_INTERVAL: %s,
+                ENABLE_HID: %s,
+                RECOIL_STRENGTH: %s,
+                SHOOT_COOLDOWN: %s,
+                SHOOT_PREDICTION: %s,
+                SHOOT_THRESHOLD: %s
+            };
+
+            function init() {
+                document.getElementById('pid_kp').value = config.PID_KP;
+                document.getElementById('pid_ki').value = config.PID_KI;
+                document.getElementById('pid_kd').value = config.PID_KD;
+                document.getElementById('mouse_sens').value = config.MOUSE_SENSITIVITY;
+                document.getElementById('aim_dead').value = config.AIM_DEADZONE;
+                document.getElementById('aim_ratio').value = config.AIM_HEIGHT_RATIO;
+                document.getElementById('aim_offx').value = config.AIM_OFFSET_X;
+                document.getElementById('aim_offy').value = config.AIM_OFFSET_Y;
+                document.getElementById('hid_smooth').value = config.HID_SMOOTH_FACTOR;
+                document.getElementById('hid_interval').value = config.HID_UPDATE_INTERVAL;
+                document.getElementById('enable_hid').checked = config.ENABLE_HID;
+                document.getElementById('recoil_strength').value = config.RECOIL_STRENGTH;
+                document.getElementById('shoot_cooldown').value = config.SHOOT_COOLDOWN;
+                document.getElementById('shoot_pred').value = config.SHOOT_PREDICTION;
+                document.getElementById('shoot_thres').value = config.SHOOT_THRESHOLD;
+                updateDisplays();
+            }
+
+            function updateDisplays() {
+                document.getElementById('val_kp').innerText = document.getElementById('pid_kp').value;
+                document.getElementById('val_ki').innerText = document.getElementById('pid_ki').value;
+                document.getElementById('val_kd').innerText = document.getElementById('pid_kd').value;
+                document.getElementById('val_sens').innerText = document.getElementById('mouse_sens').value;
+                document.getElementById('val_dead').innerText = document.getElementById('aim_dead').value;
+                document.getElementById('val_ratio').innerText = document.getElementById('aim_ratio').value;
+                document.getElementById('val_offx').innerText = document.getElementById('aim_offx').value;
+                document.getElementById('val_offy').innerText = document.getElementById('aim_offy').value;
+                document.getElementById('val_smooth').innerText = document.getElementById('hid_smooth').value;
+                document.getElementById('val_interval').innerText = document.getElementById('hid_interval').value;
+                document.getElementById('val_recoil').innerText = document.getElementById('recoil_strength').value;
+                document.getElementById('val_cooldown').innerText = document.getElementById('shoot_cooldown').value;
+                document.getElementById('val_pred').innerText = document.getElementById('shoot_pred').value;
+                document.getElementById('val_thres').innerText = document.getElementById('shoot_thres').value;
+            }
+
+            function updateConfig() {
+                updateDisplays();
+                const data = {
+                    PID_KP: parseFloat(document.getElementById('pid_kp').value),
+                    PID_KI: parseFloat(document.getElementById('pid_ki').value),
+                    PID_KD: parseFloat(document.getElementById('pid_kd').value),
+                    MOUSE_SENSITIVITY: parseFloat(document.getElementById('mouse_sens').value),
+                    AIM_DEADZONE: parseInt(document.getElementById('aim_dead').value),
+                    AIM_HEIGHT_RATIO: parseFloat(document.getElementById('aim_ratio').value),
+                    AIM_OFFSET_X: parseInt(document.getElementById('aim_offx').value),
+                    AIM_OFFSET_Y: parseInt(document.getElementById('aim_offy').value),
+                    HID_SMOOTH_FACTOR: parseFloat(document.getElementById('hid_smooth').value),
+                    HID_UPDATE_INTERVAL: parseFloat(document.getElementById('hid_interval').value),
+                    ENABLE_HID: document.getElementById('enable_hid').checked,
+                    RECOIL_STRENGTH: parseFloat(document.getElementById('recoil_strength').value),
+                    SHOOT_COOLDOWN: parseFloat(document.getElementById('shoot_cooldown').value),
+                    SHOOT_PREDICTION: parseFloat(document.getElementById('shoot_pred').value),
+                    SHOOT_THRESHOLD: parseInt(document.getElementById('shoot_thres').value)
+                };
+
+                fetch('/update_config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+            }
+
+            init();
+        </script>
       </body>
     </html>
-    """.format(MODEL_PATH)
+    """ % (PID_KP, PID_KI, PID_KD, MOUSE_SENSITIVITY, AIM_DEADZONE, AIM_HEIGHT_RATIO, AIM_OFFSET_X, AIM_OFFSET_Y, HID_SMOOTH_FACTOR, HID_UPDATE_INTERVAL, "true" if ENABLE_HID else "false", RECOIL_STRENGTH, SHOOT_COOLDOWN, SHOOT_PREDICTION, SHOOT_THRESHOLD)
+
+@app.route('/update_config', methods=['POST'])
+def update_config():
+    global PID_KP, PID_KI, PID_KD, MOUSE_SENSITIVITY, AIM_DEADZONE, AIM_HEIGHT_RATIO, AIM_OFFSET_X, AIM_OFFSET_Y, HID_SMOOTH_FACTOR, HID_UPDATE_INTERVAL, ENABLE_HID, RECOIL_STRENGTH, SHOOT_COOLDOWN, SHOOT_PREDICTION, SHOOT_THRESHOLD
+    data = request.json
+    if data:
+        PID_KP = data.get('PID_KP', PID_KP)
+        PID_KI = data.get('PID_KI', PID_KI)
+        PID_KD = data.get('PID_KD', PID_KD)
+        MOUSE_SENSITIVITY = data.get('MOUSE_SENSITIVITY', MOUSE_SENSITIVITY)
+        AIM_DEADZONE = data.get('AIM_DEADZONE', AIM_DEADZONE)
+        AIM_HEIGHT_RATIO = data.get('AIM_HEIGHT_RATIO', AIM_HEIGHT_RATIO)
+        AIM_OFFSET_X = data.get('AIM_OFFSET_X', AIM_OFFSET_X)
+        AIM_OFFSET_Y = data.get('AIM_OFFSET_Y', AIM_OFFSET_Y)
+        HID_SMOOTH_FACTOR = data.get('HID_SMOOTH_FACTOR', HID_SMOOTH_FACTOR)
+        HID_UPDATE_INTERVAL = data.get('HID_UPDATE_INTERVAL', HID_UPDATE_INTERVAL)
+        ENABLE_HID = data.get('ENABLE_HID', ENABLE_HID)
+        RECOIL_STRENGTH = data.get('RECOIL_STRENGTH', RECOIL_STRENGTH)
+        SHOOT_COOLDOWN = data.get('SHOOT_COOLDOWN', SHOOT_COOLDOWN)
+        SHOOT_PREDICTION = data.get('SHOOT_PREDICTION', SHOOT_PREDICTION)
+        SHOOT_THRESHOLD = data.get('SHOOT_THRESHOLD', SHOOT_THRESHOLD)
+        print(f"Config Updated: KP={PID_KP}, Recoil={RECOIL_STRENGTH}, Pred={SHOOT_PREDICTION}, Thres={SHOOT_THRESHOLD}")
+    return jsonify({'status': 'success'})
 
 @app.route('/video_feed')
 def video_feed():
@@ -721,6 +1126,21 @@ if __name__ == '__main__':
     t = threading.Thread(target=detection_loop)
     t.daemon = True
     t.start()
+
+    # 启动HID平滑移动线程
+    t_hid = threading.Thread(target=hid_worker)
+    t_hid.daemon = True
+    t_hid.start()
+
+    # 启动自动射击线程
+    t_shoot = threading.Thread(target=shoot_worker)
+    t_shoot.daemon = True
+    t_shoot.start()
+
+    # 启动可视化线程
+    t_vis = threading.Thread(target=vis_worker)
+    t_vis.daemon = True
+    t_vis.start()
 
     # 监听所有 IP
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
