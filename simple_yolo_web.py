@@ -252,20 +252,17 @@ class YOLO_RKNN_Wrapper:
         print(f"--> Detected RKNN model input size: {self.model_wh}")
 
     def _probe_model_size(self):
-        # Try to guess from filename first (e.g., yolov11s-640-640.rknn)
-        import re
-        match = re.search(r'-(\d+)-(\d+)\.rknn', MODEL_PATH)
-        if match:
-            return (int(match.group(1)), int(match.group(2)))
-            
         # Probe with dummy inputs
         test_sizes = [(640, 640), (1920, 1080), (1280, 720), (320, 320)]
+        print("Probing model input size...")
         for width, height in test_sizes:
             try:
+                # 创建虚拟输入 (NHWC format usually for RKNN inputs via Python API)
                 img = np.zeros((1, height, width, 3), dtype=np.uint8)
                 self.rknn.inference(inputs=[img])
+                print(f"SUCCESS: Model accepts input size {width}x{height}")
                 return (width, height)
-            except:
+            except Exception:
                 pass
         
         print("Warning: Could not determine model size, defaulting to 640x640")
