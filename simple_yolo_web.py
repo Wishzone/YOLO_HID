@@ -1,52 +1,26 @@
+import warnings
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 import cv2
 import numpy as np
 import time
-import os
 import subprocess
 import threading
+import os
+import sys
 from flask import Flask, Response
 
-# ==========================================
-#               配置参数区域
-# ==========================================
-
-# 运行引擎: 'cpu' 或 'rknn'
-ENGINE = 'rknn'
-
-# 模型路径
-# 如果是 rknn 模式，建议使用 'yolov5s-640-640.rknn'
-# 如果是 cpu 模式，建议使用 'yolo11n.pt'
-# MODEL_PATH = 'yolov5s-640-640.rknn'
-MODEL_PATH = 'yolov11s-1920-1080.rknn'
-
-# 置信度阈值 (0.0 - 1.0)
-# 只有得分高于此值的框才会被保留
-CONF_THRES = 0.5
-
-# NMS IoU 阈值 (0.0 - 1.0)
-# 用于去除重叠框，值越小去除越严格
-IOU_THRES = 0.30
-
-# 摄像头索引列表 (按顺序尝试)
-# 20: HDMI IN (rk_hdmirx)
-# 21: USB Camera
-CAMERA_INDEXES = [20, 21, 11, 0]
-
-# 摄像头采集分辨率
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-
-# 模型输入尺寸 (RKNN 模型通常固定为 640x640)
-MODEL_SIZE = (640, 640)
-
-# Web 服务配置
+# 配置参数
+ENGINE = 'rknn' # 'cpu' or 'rknn'
+MODEL_PATH = 'yolo11s-rk3588.rknn'
+CONF_THRES = 0.45
+IOU_THRES = 0.2
+CAMERA_INDEXES = [20, 21, 11]
+MODEL_SIZE = (640,640)
 HOST = '0.0.0.0'
 PORT = 5000
-
-# 目标类别 ID (0 代表 person)
 TARGET_CLASS_ID = 0
-
-# ==========================================
+HID_DEVICE = '/dev/hidg1'
+HID_TX_PATH = '/home/pi/YOLO11n/hidtx'
 
 app = Flask(__name__)
 
@@ -55,7 +29,6 @@ model_wrapper = None
 output_frame = None
 lock = threading.Lock()
 
-# COCO 类名
 COCO_CLASSES = [
     'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat','traffic light',
     'fire hydrant','stop sign','parking meter','bench','bird','cat','dog','horse','sheep','cow',
@@ -72,7 +45,6 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 def process_rknn_yolov5_output(outputs, conf_thres=0.25, input_shape=(640, 640)):
-    # 定义 Anchors (YOLOv5s default)
     anchors_by_stride = {
         8:  [[10,13], [16,30], [33,23]],
         16: [[30,61], [62,45], [59,119]],
@@ -80,79 +52,87 @@ def process_rknn_yolov5_output(outputs, conf_thres=0.25, input_shape=(640, 640))
     }
     
     all_boxes = []
-    
     for output in outputs:
-        # output shape: (1, 255, h, w)
         bs, c, h, w = output.shape
+        # 使用 input_shape 计算 stride
         stride = input_shape[0] // w
-        
-        # 根据 stride 获取对应的 anchors
-        if stride not in anchors_by_stride:
-            print(f"Warning: Unknown stride {stride}, skipping.")
-            continue
+        if stride not in anchors_by_stride: continue
             
-        grid_anchors = anchors_by_stride[stride]
-        grid_anchors = np.array(grid_anchors).reshape(3, 2)
+        grid_anchors = np.array(anchors_by_stride[stride]).reshape(3, 2)
+        na, no = 3, c // 3
         
-        na = 3 # number of anchors
-        no = c // na # 85
-        
-        # Reshape and transpose: (bs, na, no, h, w) -> (bs, na, h, w, no)
         output = output.reshape(bs, na, no, h, w).transpose(0, 1, 3, 4, 2)
-        
-        # Sigmoid
         output = sigmoid(output)
         
-        # Grid
         grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
         grid = np.stack((grid_x, grid_y), axis=-1).reshape(1, 1, h, w, 2)
-        
-        # Anchors tensor
         anchors_tensor = grid_anchors.reshape(1, na, 1, 1, 2)
         
-        # Decode xy, wh
         xy = (output[..., 0:2] * 2 - 0.5 + grid) * stride
         wh = (output[..., 2:4] * 2) ** 2 * anchors_tensor
+        scores = output[..., 4:5] * output[..., 5:]
         
-        # Conf and Cls
-        obj_conf = output[..., 4:5]
-        cls_conf = output[..., 5:]
-        
-        # Combine scores: obj * cls
-        scores = obj_conf * cls_conf
-        
-        # Flatten
         xy = xy.reshape(-1, 2)
         wh = wh.reshape(-1, 2)
         scores = scores.reshape(-1, scores.shape[-1])
         
-        # Filter by conf threshold
         cls_ids = np.argmax(scores, axis=1)
         max_scores = scores[np.arange(scores.shape[0]), cls_ids]
         
-        # Filter for target class and score
         mask = (max_scores > conf_thres) & (cls_ids == TARGET_CLASS_ID)
-        boxes = np.stack((xy[:, 0] - wh[:, 0] / 2, 
-                          xy[:, 1] - wh[:, 1] / 2, 
-                          xy[:, 0] + wh[:, 0] / 2, 
-                          xy[:, 1] + wh[:, 1] / 2), axis=1)
+        boxes = np.stack((xy[:, 0] - wh[:, 0] / 2, xy[:, 1] - wh[:, 1] / 2, 
+                          xy[:, 0] + wh[:, 0] / 2, xy[:, 1] + wh[:, 1] / 2), axis=1)
         
-        boxes = boxes[mask]
-        max_scores = max_scores[mask]
-        cls_ids = cls_ids[mask]
+        if np.any(mask):
+            all_boxes.append(np.concatenate([boxes[mask], max_scores[mask][:, None], cls_ids[mask][:, None].astype(np.float32)], axis=1))
         
-        if boxes.shape[0] > 0:
-            dets = np.concatenate([
-                boxes, 
-                max_scores[:, None], 
-                cls_ids[:, None].astype(np.float32)
-            ], axis=1)
-            all_boxes.append(dets)
+    return np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 6), dtype=np.float32)
+
+def process_rknn_yolov8_output(outputs, conf_thres=0.25, input_shape=(640, 640)):
+    # YOLOv8/v11 output shape is typically (1, 84, 8400)
+    # 84 = 4 (box) + 80 (classes)
+    output = outputs[0]
+    
+    # Remove batch dimension
+    output = np.squeeze(output) # (84, 8400)
+    
+    # Transpose to (8400, 84) if needed
+    if output.shape[0] < output.shape[1]:
+        output = output.T
         
-    if not all_boxes:
+    # Split boxes and scores
+    # YOLOv8/11 export usually gives cx, cy, w, h
+    boxes = output[:, :4] 
+    scores = output[:, 4:]
+    
+    # Get max score and class ID
+    class_ids = np.argmax(scores, axis=1)
+    max_scores = scores[np.arange(scores.shape[0]), class_ids]
+    
+    # Filter
+    mask = (max_scores > conf_thres) & (class_ids == TARGET_CLASS_ID)
+    
+    boxes = boxes[mask]
+    max_scores = max_scores[mask]
+    class_ids = class_ids[mask]
+    
+    if len(boxes) == 0:
         return np.zeros((0, 6), dtype=np.float32)
         
-    return np.concatenate(all_boxes, axis=0)
+    # Convert cx,cy,w,h to x1,y1,x2,y2
+    x = boxes[:, 0]
+    y = boxes[:, 1]
+    w = boxes[:, 2]
+    h = boxes[:, 3]
+    
+    x1 = x - w / 2
+    y1 = y - h / 2
+    x2 = x + w / 2
+    y2 = y + h / 2
+    
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    
+    return np.concatenate([boxes_xyxy, max_scores[:, None], class_ids[:, None].astype(np.float32)], axis=1)
 
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
     shape = img.shape[:2]  # hw
@@ -162,8 +142,16 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
     h0, w0 = shape
     h, w = new_shape[1], new_shape[0]
 
+    # 避免除以零错误
+    if h0 == 0 or w0 == 0:
+        return img, 1.0, (0, 0)
+
     r = min(w / w0, h / h0)
     new_unpad = (int(round(w0 * r)), int(round(h0 * r)))
+    
+    # 确保 new_unpad 尺寸至少为 1x1
+    new_unpad = (max(1, new_unpad[0]), max(1, new_unpad[1]))
+    
     dw, dh = w - new_unpad[0], h - new_unpad[1]
     dw /= 2
     dh /= 2
@@ -200,88 +188,45 @@ def nms(boxes, scores, iou_threshold=0.45):
         order = order[inds + 1]
     return keep
 
-def postprocess_yolo(outputs, conf_thres=0.25, iou_thres=0.45):
-    # Check if outputs are raw YOLOv5 feature maps (3 tensors, 255 channels)
-    if isinstance(outputs, (list, tuple)) and len(outputs) == 3:
-        # Check shape of first output
-        if outputs[0].ndim == 4 and outputs[0].shape[1] == 255:
-            dets = process_rknn_yolov5_output(outputs, conf_thres=conf_thres)
-            # NMS
-            if dets.shape[0] == 0:
-                return dets
-            
-            boxes = dets[:, :4]
-            scores = dets[:, 4]
-            cls_ids = dets[:, 5]
-            
-            keep = nms(boxes, scores, iou_threshold=iou_thres)
-            return dets[keep]
-
+def postprocess_yolo(outputs, conf_thres=0.25, iou_thres=0.45, input_shape=(640, 640)):
+    dets = np.zeros((0, 6), dtype=np.float32)
+    
+    # Auto-detect output format
     if isinstance(outputs, (list, tuple)):
-        outs = [o for o in outputs if isinstance(o, np.ndarray)]
-        if not outs:
-            return np.zeros((0, 6), dtype=np.float32)
-        out = max(outs, key=lambda a: (a.shape[-1] if a.ndim >= 2 else 0))
+        if len(outputs) == 3 and outputs[0].ndim == 4:
+             # Likely YOLOv5/v7 (3 output layers)
+             dets = process_rknn_yolov5_output(outputs, conf_thres=conf_thres, input_shape=input_shape)
+        elif len(outputs) == 1:
+             # Likely YOLOv8/v11 (1 output layer)
+             dets = process_rknn_yolov8_output(outputs, conf_thres=conf_thres, input_shape=input_shape)
+        else:
+             # Try to handle generic case or warn
+             try:
+                 dets = process_rknn_yolov8_output(outputs, conf_thres=conf_thres, input_shape=input_shape)
+             except:
+                 print(f"Warning: Unknown output shape: {[o.shape for o in outputs]}")
+                 return np.zeros((0, 6), dtype=np.float32)
     else:
-        out = outputs
+        # Single tensor output
+        dets = process_rknn_yolov8_output([outputs], conf_thres=conf_thres, input_shape=input_shape)
 
-    out = np.squeeze(out)
-    if out.ndim == 1:
-        out = np.expand_dims(out, 0)
-
-    if out.shape[-1] < 10:
-        return np.zeros((0, 6), dtype=np.float32)
-
-    boxes = out[:, :4]
-    cls_scores = out[:, 4:]
-    cls_ids = np.argmax(cls_scores, axis=1)
-    scores = cls_scores[np.arange(cls_scores.shape[0]), cls_ids]
-
-    mask = (scores >= conf_thres) & (cls_ids == TARGET_CLASS_ID)
-    boxes = boxes[mask]
-    scores = scores[mask]
-    cls_ids = cls_ids[mask]
-
-    if boxes.shape[0] == 0:
-        return np.zeros((0, 6), dtype=np.float32)
-
-    cxcywh_like = np.mean(boxes[:, 2] > 0) > 0.5 and np.mean(boxes[:, 3] > 0) > 0.5
-    if cxcywh_like:
-        x = boxes[:, 0]
-        y = boxes[:, 1]
-        w = boxes[:, 2]
-        h = boxes[:, 3]
-        x1 = x - w / 2
-        y1 = y - h / 2
-        x2 = x + w / 2
-        y2 = y + h / 2
-        boxes = np.stack([x1, y1, x2, y2], axis=1)
-
-    keep = nms(boxes, scores, iou_threshold=iou_thres)
-    boxes = boxes[keep]
-    scores = scores[keep]
-    cls_ids = cls_ids[keep]
-
-    dets = np.concatenate([
-        boxes.astype(np.float32),
-        scores[:, None].astype(np.float32),
-        cls_ids[:, None].astype(np.float32)
-    ], axis=1)
-    return dets
+    if dets.shape[0] == 0: return dets
+    
+    # NMS
+    keep = nms(dets[:, :4], dets[:, 4], iou_threshold=iou_thres)
+    return dets[keep]
 
 def draw_detections(img, dets):
     h, w = img.shape[:2]
     for x1, y1, x2, y2, score, cls in dets:
-        x1 = int(max(0, min(w - 1, x1)))
-        y1 = int(max(0, min(h - 1, y1)))
-        x2 = int(max(0, min(w - 1, x2)))
-        y2 = int(max(0, min(h - 1, y2)))
+        x1 = int(max(0, min(x1, w - 1)))
+        y1 = int(max(0, min(y1, h - 1)))
+        x2 = int(max(0, min(x2, w - 1)))
+        y2 = int(max(0, min(y2, h - 1)))
+
         cls = int(cls)
         label = COCO_CLASSES[cls] if 0 <= cls < len(COCO_CLASSES) else str(cls)
-        
-        color = (0, 255, 0)
-        if label == 'person':
-            color = (0, 0, 255) # Red for person
+        color = (0, 0, 255) if label == 'person' else (0, 255, 0)
 
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
         txt = f'{label} {score:.2f}'
@@ -297,16 +242,15 @@ class YOLO_RKNN_Wrapper:
         from rknnlite.api import RKNNLite
         self.rknn = RKNNLite()
         print(f'--> Loading RKNN model: {model_path}')
+        if not os.path.exists(model_path):
+            print(f"Error: Model file {model_path} not found!")
+            sys.exit(1)
+            
         ret = self.rknn.load_rknn(model_path)
         if ret != 0:
             print('Load RKNN model failed')
-            exit(ret)
-        print('--> Init runtime environment')
-        ret = self.rknn.init_runtime()
-        if ret != 0:
-            print('Init runtime environment failed')
-            exit(ret)
-        print('done')
+            sys.exit(ret)
+        self.rknn.init_runtime()
         self.model_wh = MODEL_SIZE
 
     def detect(self, frame):
@@ -317,9 +261,9 @@ class YOLO_RKNN_Wrapper:
         
         # Inference
         outputs = self.rknn.inference(inputs=[input_tensor])
-        
+
         # Postprocess
-        dets = postprocess_yolo(outputs, conf_thres=CONF_THRES, iou_thres=IOU_THRES)
+        dets = postprocess_yolo(outputs, conf_thres=CONF_THRES, iou_thres=IOU_THRES, input_shape=self.model_wh)
         
         # Map back to original image
         if dets.shape[0] > 0:
@@ -359,79 +303,76 @@ def detection_loop():
     cap = None
     
     for idx in CAMERA_INDEXES:
-        print(f"尝试打开摄像头 index {idx} ...")
         temp_cap = cv2.VideoCapture(idx)
         if temp_cap.isOpened():
-            print(f"成功打开摄像头 index {idx}")
+            print(f"Opened camera index {idx}")
             cap = temp_cap
             break
-        else:
-            print(f"无法打开摄像头 index {idx}")
     
     if cap is None or not cap.isOpened():
-        print("无法打开任何摄像头")
+        print("No camera found")
         return
 
-    # 不强制设置分辨率，使用设备默认分辨率 (自适应)
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    center_x, center_y = actual_width / 2, actual_height / 2
     
-    # 获取实际分辨率
-    actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    print(f"当前摄像头分辨率: {actual_width}x{actual_height}")
-
-    # 鼠标当前位置 (初始化为画面中心)
-    mouse_x = actual_width / 2
-    mouse_y = actual_height / 2
+    print(f"Camera resolution: {actual_width}x{actual_height}")
 
     while True:
         success, frame = cap.read()
         if not success:
-            print("无法读取帧 (Can't receive frame)")
             time.sleep(0.1)
             continue
         
-        # 推理
+        # 修复某些特定 OpenCV 版本返回扁平化数组的问题
+        if frame.ndim == 2 and frame.shape[0] == 1:
+            expected_len = actual_width * actual_height * 3
+            if frame.shape[1] == expected_len:
+                try:
+                    frame = frame.reshape((actual_height, actual_width, 3))
+                except Exception as e:
+                    print(f"Reshape failed: {e}")
+                    continue
+        
         dets = model_wrapper.detect(frame)
         
-        # 查找第一个人物并打印坐标
-        found_person = False
+        # Find target closest to center
+        target = None
+        min_dist = float('inf')
+        
         for det in dets:
-            # det: [x1, y1, x2, y2, score, cls]
-            cls_id = int(det[5])
-            if cls_id == TARGET_CLASS_ID:
+            if int(det[5]) == TARGET_CLASS_ID:
                 x1, y1, x2, y2 = det[:4]
-                print(f"检测到目标: 坐标 (x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f})")
-                
-                # 计算中心点
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-                
-                # 计算相对于当前鼠标位置的偏移量
-                dx = cx - mouse_x
-                dy = cy - mouse_y
-                
-                # 调用 hidtx 移动鼠标
-                # 只有当偏移量足够大时才移动，避免抖动
-                if abs(dx) >= 1 or abs(dy) >= 1:
-                    try:
-                        # 注意：这里假设 hidtx 在当前目录下，且有执行权限
-                        subprocess.run(['sudo', '/home/pi/YOLO11n/hidtx', '/dev/hidg1', str(int(dx)), str(int(dy))], check=False)
-                        # 更新鼠标位置
-                        mouse_x = cx
-                        mouse_y = cy
-                    except Exception as e:
-                        print(f"Error calling hidtx: {e}")
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                dist = (cx - center_x)**2 + (cy - center_y)**2
+                if dist < min_dist:
+                    min_dist = dist
+                    target = (cx, cy)
+        
+        if target:
+            cx, cy = target
+            dx = cx - center_x
+            dy = cy - center_y
+            
+            # Deadzone and sensitivity
+            if abs(dx) >= 2 or abs(dy) >= 2:
+                try:
+                    if os.path.exists(HID_TX_PATH):
+                        subprocess.run(['sudo', HID_TX_PATH, HID_DEVICE, str(int(dx)), str(int(dy))], check=False)
+                except Exception:
+                    pass
+        
+        vis = draw_detections(frame.copy(), dets)
+        # Draw crosshair
+        cv2.line(vis, (int(center_x)-10, int(center_y)), (int(center_x)+10, int(center_y)), (0,255,255), 1)
+        cv2.line(vis, (int(center_x), int(center_y)-10), (int(center_x), int(center_y)+10), (0,255,255), 1)
+        
+        # Sanity check
+        if vis.shape[0] > 4000 or vis.shape[1] > 4000:
+            print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
+            continue
 
-                found_person = True
-                break # 只打印第一个
-        
-        # 绘制结果
-        vis = frame.copy()
-        vis = draw_detections(vis, dets)
-        
-        # 更新全局帧
         with lock:
             output_frame = vis.copy()
 
@@ -444,9 +385,22 @@ def generate_frames():
             if output_frame is None:
                 time.sleep(0.01)
                 continue
-            # 将图像编码为 JPEG
-            ret, buffer = cv2.imencode('.jpg', output_frame)
-            frame_bytes = buffer.tobytes()
+            
+            # 检查图像尺寸
+            h, w = output_frame.shape[:2]
+            if h == 0 or w == 0 or h > 4000 or w > 4000:
+                # print(f"Skipping invalid frame size: {w}x{h}")
+                continue
+
+            try:
+                # 将图像编码为 JPEG
+                ret, buffer = cv2.imencode('.jpg', output_frame)
+                if not ret:
+                    continue
+                frame_bytes = buffer.tobytes()
+            except Exception as e:
+                print(f"Encode error: {e}, shape={output_frame.shape}")
+                continue
         
         # 生成流数据
         yield (b'--frame\r\n'
