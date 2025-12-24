@@ -131,8 +131,9 @@ def process_rknn_yolov5_output(outputs, conf_thres=0.25, input_shape=(640, 640))
         
     return np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 6), dtype=np.float32)
 
+# Also compatible with YOLOv10 and YOLOv11
 def process_rknn_yolov8_output(outputs, conf_thres=0.25, input_shape=(640, 640)):
-    # YOLOv8/v11 output shape is typically (1, 84, 8400)
+    # YOLOv8/v10/v11 output shape is typically (1, 84, 8400)
     # 84 = 4 (box) + 80 (classes)
     output = outputs[0]
     
@@ -144,7 +145,7 @@ def process_rknn_yolov8_output(outputs, conf_thres=0.25, input_shape=(640, 640))
         output = output.T
         
     # Split boxes and scores
-    # YOLOv8/11 export usually gives cx, cy, w, h
+    # YOLOv8/10/11 export usually gives cx, cy, w, h
     boxes = output[:, :4] 
     scores = output[:, 4:]
     
@@ -176,6 +177,10 @@ def process_rknn_yolov8_output(outputs, conf_thres=0.25, input_shape=(640, 640))
     boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
     
     return np.concatenate([boxes_xyxy, max_scores[:, None], class_ids[:, None].astype(np.float32)], axis=1)
+
+# Aliases for clarity
+process_rknn_yolov10_output = process_rknn_yolov8_output
+process_rknn_yolov11_output = process_rknn_yolov8_output
 
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
     shape = img.shape[:2]  # hw
@@ -240,7 +245,7 @@ def postprocess_yolo(outputs, conf_thres=0.25, iou_thres=0.45, input_shape=(640,
              # Likely YOLOv5/v7 (3 output layers)
              dets = process_rknn_yolov5_output(outputs, conf_thres=conf_thres, input_shape=input_shape)
         elif len(outputs) == 1:
-             # Likely YOLOv8/v11 (1 output layer)
+             # Likely YOLOv8/v10/v11 (1 output layer)
              dets = process_rknn_yolov8_output(outputs, conf_thres=conf_thres, input_shape=input_shape)
         else:
              # Try to handle generic case or warn
