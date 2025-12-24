@@ -11,12 +11,14 @@ from flask import Flask, Response
 from queue import Queue
 
 # 配置参数
-MODEL_PATH = './Models/yolo11n-rk3588.rknn'
-CONF_THRES = 0.45
-IOU_THRES = 0.2
+MODEL_PATH = './Models/best-rk3588.rknn'
+CONF_THRES = 0.7
+IOU_THRES = 0.4
 CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
-TARGET_CLASS_ID = 1
+TARGET_CLASS_ID = 0
+ENABLE_HID = True # 是否启用HID控制
+HID_MOVE_COOLDOWN = 0.2 # HID移动冷却时间(秒)
 HID_DEVICE = '/dev/hidg1'
 HID_TX_PATH = '/home/pi/YOLO11n/HID/hidtx'
 
@@ -25,6 +27,7 @@ app = Flask(__name__)
 # 全局变量
 model_wrapper = None
 output_frame = None
+last_hid_move_time = 0
 lock = threading.Lock()
 
 COCO_CLASSES = [
@@ -423,7 +426,7 @@ class YOLO_CPU_Wrapper:
             return np.zeros((0, 6))
 
 def process_frame_result(frame, dets, center_x, center_y):
-    global output_frame
+    global output_frame, last_hid_move_time
     
     # Find target closest to center
     target = None
@@ -444,10 +447,12 @@ def process_frame_result(frame, dets, center_x, center_y):
         dy = cy - center_y
         
         # Deadzone and sensitivity
-        if abs(dx) >= 2 or abs(dy) >= 2:
+        current_time = time.time()
+        if ENABLE_HID and (abs(dx) >= 2 or abs(dy) >= 2) and (current_time - last_hid_move_time > HID_MOVE_COOLDOWN):
             try:
                 if os.path.exists(HID_TX_PATH):
                     subprocess.run(['sudo', HID_TX_PATH, HID_DEVICE, str(int(dx)), str(int(dy))], check=False)
+                    last_hid_move_time = current_time
             except Exception:
                 pass
     
