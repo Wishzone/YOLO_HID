@@ -10,14 +10,14 @@ import sys
 from flask import Flask, Response
 
 # 配置参数
-MODEL_PATH = 'yolo11s-rk3588.rknn'
+MODEL_PATH = './Models/yolo11s-rk3588.rknn'
 CONF_THRES = 0.45
 IOU_THRES = 0.2
 CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
 TARGET_CLASS_ID = 0
 HID_DEVICE = '/dev/hidg1'
-HID_TX_PATH = '/home/pi/YOLO11n/hidtx'
+HID_TX_PATH = '/home/pi/YOLO11n/HID/hidtx'
 
 app = Flask(__name__)
 
@@ -36,6 +36,51 @@ COCO_CLASSES = [
     'bed','dining table','toilet','tv','laptop','mouse','remote','keyboard','cell phone','microwave',
     'oven','toaster','sink','refrigerator','book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
 ]
+
+
+class SilenceAndPrint:
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.real_stdout = None
+        self.saved_stdout_fd = None
+        self.saved_stderr_fd = None
+        self.capture_path = "/tmp/rknn_capture.log"
+        self.capture_file = None
+        
+    def __enter__(self):
+        if self.verbose: 
+            return sys.stdout
+            
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        self.saved_stdout_fd = os.dup(1)
+        self.saved_stderr_fd = os.dup(2)
+        
+        self.real_stdout = os.fdopen(os.dup(self.saved_stdout_fd), 'w')
+        
+        self.capture_file = open(self.capture_path, 'w+')
+        os.dup2(self.capture_file.fileno(), 1)
+        os.dup2(self.capture_file.fileno(), 2)
+        
+        return self.real_stdout
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.verbose: return
+        
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        os.dup2(self.saved_stdout_fd, 1)
+        os.dup2(self.saved_stderr_fd, 2)
+        
+        os.close(self.saved_stdout_fd)
+        os.close(self.saved_stderr_fd)
+        
+        if self.real_stdout:
+            self.real_stdout.close()
+        if self.capture_file:
+            self.capture_file.close()
 
 # --- 辅助函数 (用于 RKNN 后处理) ---
 def sigmoid(x):
@@ -237,33 +282,38 @@ def draw_detections(img, dets):
 class YOLO_RKNN_Wrapper:
     def __init__(self, model_path):
         from rknnlite.api import RKNNLite
-        self.rknn = RKNNLite()
-        print(f'--> Loading RKNN model: {model_path}')
+        
         if not os.path.exists(model_path):
             print(f"Error: Model file {model_path} not found!")
             sys.exit(1)
+
+        with SilenceAndPrint(verbose=False):
+            self.rknn = RKNNLite()
+            ret = self.rknn.load_rknn(model_path)
+            if ret != 0:
+                print('Load RKNN model failed')
+                sys.exit(ret)
+            self.rknn.init_runtime()
             
-        ret = self.rknn.load_rknn(model_path)
-        if ret != 0:
-            print('Load RKNN model failed')
-            sys.exit(ret)
-        self.rknn.init_runtime()
         self.model_wh = self._probe_model_size()
-        print(f"--> Detected RKNN model input size: {self.model_wh}")
+        # print(f"--> Detected RKNN model input size: {self.model_wh}")
 
     def _probe_model_size(self):
         # Probe with dummy inputs
-        test_sizes = [(640, 640), (1920, 1080), (1280, 720), (320, 320)]
-        print("Probing model input size...")
-        for width, height in test_sizes:
-            try:
-                # 创建虚拟输入 (NHWC format usually for RKNN inputs via Python API)
-                img = np.zeros((1, height, width, 3), dtype=np.uint8)
-                self.rknn.inference(inputs=[img])
-                print(f"SUCCESS: Model accepts input size {width}x{height}")
-                return (width, height)
-            except Exception:
-                pass
+        test_sizes = [320, 416, 512, 640, 736, 768, 960, 1280]
+        
+        with SilenceAndPrint(verbose=False) as out:
+            for size in test_sizes:
+                width, height = size, size
+                try:
+                    # 创建虚拟输入 (NHWC format usually for RKNN inputs via Python API)
+                    img = np.zeros((1, height, width, 3), dtype=np.uint8)
+                    outputs = self.rknn.inference(inputs=[img])
+                    if outputs is not None:
+                        if out: out.write(f"SUCCESS: Model accepts input size {width}x{height}\n")
+                        return (width, height)
+                except Exception:
+                    pass
         
         print("Warning: Could not determine model size, defaulting to 640x640")
         return (640, 640)
@@ -293,7 +343,7 @@ class YOLO_RKNN_Wrapper:
 class YOLO_CPU_Wrapper:
     def __init__(self, model_path):
         from ultralytics import YOLO
-        print(f'--> Loading CPU model: {model_path}')
+        # print(f'--> Loading CPU model: {model_path}')
         self.model = YOLO(model_path)
     
     def detect(self, frame):
@@ -320,7 +370,7 @@ def detection_loop():
     for idx in CAMERA_INDEXES:
         temp_cap = cv2.VideoCapture(idx)
         if temp_cap.isOpened():
-            print(f"Opened camera index {idx}")
+            # print(f"Opened camera index {idx}")
             cap = temp_cap
             break
     
@@ -332,7 +382,11 @@ def detection_loop():
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     center_x, center_y = actual_width / 2, actual_height / 2
     
-    print(f"Camera resolution: {actual_width}x{actual_height}")
+    # print(f"Camera resolution: {actual_width}x{actual_height}")
+
+    fps_start_time = time.time()
+    fps_counter = 0
+    fps = 0
 
     while True:
         success, frame = cap.read()
@@ -347,7 +401,7 @@ def detection_loop():
                 try:
                     frame = frame.reshape((actual_height, actual_width, 3))
                 except Exception as e:
-                    print(f"Reshape failed: {e}")
+                    # print(f"Reshape failed: {e}")
                     continue
         
         dets = model_wrapper.detect(frame)
@@ -383,9 +437,18 @@ def detection_loop():
         cv2.line(vis, (int(center_x)-10, int(center_y)), (int(center_x)+10, int(center_y)), (0,255,255), 1)
         cv2.line(vis, (int(center_x), int(center_y)-10), (int(center_x), int(center_y)+10), (0,255,255), 1)
         
+        # Calculate FPS
+        fps_counter += 1
+        if time.time() - fps_start_time >= 1.0:
+            fps = fps_counter / (time.time() - fps_start_time)
+            fps_counter = 0
+            fps_start_time = time.time()
+        
+        cv2.putText(vis, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
         # Sanity check
         if vis.shape[0] > 4000 or vis.shape[1] > 4000:
-            print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
+            # print(f"Warning: Abnormal frame size detected: {vis.shape}, skipping...")
             continue
 
         with lock:
