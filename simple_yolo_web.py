@@ -10,13 +10,10 @@ import sys
 from flask import Flask, Response
 
 # 配置参数
-ENGINE = 'rknn' # 'cpu' or 'rknn'
 MODEL_PATH = 'yolo11s-rk3588.rknn'
 CONF_THRES = 0.45
 IOU_THRES = 0.2
-CAMERA_INDEXES = [20, 21, 11]
-MODEL_SIZE = (640,640)
-HOST = '0.0.0.0'
+CAMERA_INDEXES = [20, 21, 11, 0]
 PORT = 5000
 TARGET_CLASS_ID = 0
 HID_DEVICE = '/dev/hidg1'
@@ -251,7 +248,28 @@ class YOLO_RKNN_Wrapper:
             print('Load RKNN model failed')
             sys.exit(ret)
         self.rknn.init_runtime()
-        self.model_wh = MODEL_SIZE
+        self.model_wh = self._probe_model_size()
+        print(f"--> Detected RKNN model input size: {self.model_wh}")
+
+    def _probe_model_size(self):
+        # Try to guess from filename first (e.g., yolov11s-640-640.rknn)
+        import re
+        match = re.search(r'-(\d+)-(\d+)\.rknn', MODEL_PATH)
+        if match:
+            return (int(match.group(1)), int(match.group(2)))
+            
+        # Probe with dummy inputs
+        test_sizes = [(640, 640), (1920, 1080), (1280, 720), (320, 320)]
+        for width, height in test_sizes:
+            try:
+                img = np.zeros((1, height, width, 3), dtype=np.uint8)
+                self.rknn.inference(inputs=[img])
+                return (width, height)
+            except:
+                pass
+        
+        print("Warning: Could not determine model size, defaulting to 640x640")
+        return (640, 640)
 
     def detect(self, frame):
         # Preprocess
@@ -416,11 +434,11 @@ def index():
       </head>
       <body>
         <h1>YOLO Video Stream</h1>
-        <p>Engine: {} | Model: {}</p>
+        <p>Model: {}</p>
         <img src="/video_feed" width="100%">
       </body>
     </html>
-    """.format(ENGINE, MODEL_PATH)
+    """.format(MODEL_PATH)
 
 @app.route('/video_feed')
 def video_feed():
@@ -429,10 +447,13 @@ def video_feed():
 
 if __name__ == '__main__':
     # 初始化模型
-    if ENGINE == 'rknn':
+    if MODEL_PATH.endswith('.rknn'):
         model_wrapper = YOLO_RKNN_Wrapper(MODEL_PATH)
-    else:
+    elif MODEL_PATH.endswith('.pt'):
         model_wrapper = YOLO_CPU_Wrapper(MODEL_PATH)
+    else:
+        print(f"Error: Unsupported model format: {MODEL_PATH}")
+        sys.exit(1)
 
     # 启动检测线程
     t = threading.Thread(target=detection_loop)
@@ -440,4 +461,4 @@ if __name__ == '__main__':
     t.start()
 
     # 监听所有 IP
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
