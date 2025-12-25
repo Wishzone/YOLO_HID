@@ -91,9 +91,9 @@ atexit.register(cleanup)
 try:
     subprocess.run(['sudo', 'chmod', '666', HID_DEVICE], check=False)
     hid_file = open(HID_DEVICE, 'wb', buffering=0)
-    print(f"HID device ready: {HID_DEVICE}")
+    print(f"[HID] Ready: {HID_DEVICE}")
 except Exception as e:
-    print(f"HID error: {e}")
+    print(f"[HID] Error: {e}")
     ENABLE_HID = False
 
 # --- 图像处理辅助函数 ---
@@ -334,7 +334,7 @@ def detection_loop():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cx, cy = (w / 2) + AIM_OFFSET_X, (h / 2) + AIM_OFFSET_Y
-    print(f"Cam: {w}x{h}")
+    print(f"[Camera] {w}x{h}")
 
     if hasattr(model_wrapper, 'start'): model_wrapper.start()
 

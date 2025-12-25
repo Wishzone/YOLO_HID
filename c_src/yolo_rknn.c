@@ -138,13 +138,12 @@ void* init_model(const char* model_path) {
     RKNN_Context* ctx = (RKNN_Context*)malloc(sizeof(RKNN_Context));
     memset(ctx, 0, sizeof(RKNN_Context));
 
-    printf("C: Loading model from %s\n", model_path);
 
     // Load model
     int model_data_size = 0;
     unsigned char* model_data = load_model(model_path, &model_data_size);
     if (model_data == NULL) {
-        printf("Failed to load model file: %s\n", model_path);
+        printf("[RKNN] Model load failed: %s\n", model_path);
         free(ctx);
         return NULL;
     }
@@ -152,16 +151,15 @@ void* init_model(const char* model_path) {
     ret = rknn_init(&ctx->ctx, model_data, model_data_size, 0, NULL);
     free(model_data);
     if (ret < 0) {
-        printf("rknn_init failed! ret=%d\n", ret);
+        printf("[RKNN] rknn_init failed! ret=%d\n", ret);
         free(ctx);
         return NULL;
     }
-    printf("C: rknn_init success\n");
 
     // Query IO
     ret = rknn_query(ctx->ctx, RKNN_QUERY_IN_OUT_NUM, &ctx->io_num, sizeof(ctx->io_num));
     if (ret < 0) {
-        printf("rknn_query IO failed\n");
+        printf("[RKNN] rknn_query IO failed\n");
         free(ctx);
         return NULL;
     }
@@ -172,19 +170,11 @@ void* init_model(const char* model_path) {
     for (int i = 0; i < ctx->io_num.n_input; i++) {
         ctx->input_attrs[i].index = i;
         ret = rknn_query(ctx->ctx, RKNN_QUERY_INPUT_ATTR, &(ctx->input_attrs[i]), sizeof(rknn_tensor_attr));
-        if (ret < 0) printf("query input attr %d failed\n", i);
     }
     for (int i = 0; i < ctx->io_num.n_output; i++) {
         ctx->output_attrs[i].index = i;
         ret = rknn_query(ctx->ctx, RKNN_QUERY_OUTPUT_ATTR, &(ctx->output_attrs[i]), sizeof(rknn_tensor_attr));
-        if (ret < 0) printf("query output attr %d failed\n", i);
     }
-
-
-    // Assume input 0 is the image
-    printf("Input 0 fmt: %d (NHWC=%d, NCHW=%d)\n", ctx->input_attrs[0].fmt, RKNN_TENSOR_NHWC, RKNN_TENSOR_NCHW);
-    printf("Input 0 type: %d (UINT8=%d, INT8=%d, FLOAT=%d)\n", ctx->input_attrs[0].type, RKNN_TENSOR_UINT8, RKNN_TENSOR_INT8, RKNN_TENSOR_FLOAT32);
-    printf("Input 0 ZP: %d, Scale: %f\n", ctx->input_attrs[0].zp, ctx->input_attrs[0].scale);
 
     if (ctx->input_attrs[0].fmt == RKNN_TENSOR_NHWC) {
         ctx->model_width = ctx->input_attrs[0].dims[2];
@@ -193,18 +183,8 @@ void* init_model(const char* model_path) {
         ctx->model_width = ctx->input_attrs[0].dims[3];
         ctx->model_height = ctx->input_attrs[0].dims[2];
     }
-    
-    printf("C Model Init: %dx%d\n", ctx->model_width, ctx->model_height);
-    
-    // Print Output Dims and Attributes
-    for (int i = 0; i < ctx->io_num.n_output; i++) {
-        printf("Output %d dims: %d %d %d %d\n", i, 
-            ctx->output_attrs[i].dims[0],
-            ctx->output_attrs[i].dims[1],
-            ctx->output_attrs[i].dims[2],
-            ctx->output_attrs[i].dims[3]);
-        printf("Output %d ZP: %d, Scale: %f\n", i, ctx->output_attrs[i].zp, ctx->output_attrs[i].scale);
-    }
+
+    printf("[RKNN] Model Ready: %dx%d\n", ctx->model_width, ctx->model_height);
 
     ctx->is_init = true;
     return (void*)ctx;
