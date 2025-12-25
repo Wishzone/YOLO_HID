@@ -227,7 +227,8 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
 
     static int frame_count = 0;
     frame_count++;
-    bool debug_print = (frame_count % 60 == 0); // Print every 60 frames
+    // bool debug_print = (frame_count % 60 == 0); // Print every 60 frames
+    bool debug_print = false; // Disable debug prints for cleaner output
 
     struct timeval start_time, stop_time;
     double time_diff;
