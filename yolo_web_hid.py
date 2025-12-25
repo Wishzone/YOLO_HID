@@ -14,9 +14,11 @@ import atexit
 
 # 配置参数
 MODEL_PATH = './Models/cf-11n-rk3588.rknn'
-CONF_THRES = 0.7
+# MODEL_PATH = './Models/cf-11s-rk3588-int8.rknn'
+CONF_THRES = 0.5
 IOU_THRES = 0.4
-CAMERA_INDEXES = [20, 21, 11, 0]
+USE_RGB_INPUT = True # INT8 模型通常需要 BGR 输入，如果识别不准请尝试改为 True
+CAMERA_INDEXES = [21, 20, 11, 0]
 PORT = 5000
 TARGET_CLASS_ID = 0
 ENABLE_HID = True # 是否启用HID控制
@@ -25,12 +27,12 @@ HID_DEVICE = '/dev/hidg1'
 MOUSE_SENSITIVITY = 0.4 # 鼠标灵敏度系数
 
 # 自动射击配置
-AUTO_SHOOT = False # 是否启用自动射击
+AUTO_SHOOT = True # 是否启用自动射击
 SHOOT_COOLDOWN = 0.03 # 射击冷却时间 (秒) - 增加冷却时间以防止卡顿
 SHOOT_THRESHOLD = 30 # 射击触发范围 (像素距离)
 SHOOT_DURATION = 0.02 # 点击持续时间 (秒)
 SHOOT_PREDICTION = 9 # 射击预测 (帧) - 提前多少帧进行射击判定
-SHOOT_SUSTAIN_TIME = 0.15 # 射击信号保持时间 (秒)
+SHOOT_SUSTAIN_TIME = 0 # 射击信号保持时间 (秒)
 RECOIL_STRENGTH = 3.0 # 压枪力度 (像素/次)
 
 # 准星偏移校准 (如果摄像头没有完全对准屏幕中心，调整这里)
@@ -38,13 +40,13 @@ AIM_OFFSET_X = 0 # 正数向右偏移，负数向左偏移
 AIM_OFFSET_Y = 0 # 正数向下偏移，负数向上偏移
 AIM_DEADZONE = 0 # 瞄准死区 (像素)，目标在此范围内不进行移动
 AIM_HEIGHT_RATIO = 0.10 # 瞄准高度比例 (0.0=头顶, 0.5=中心, 1.0=脚底)
-HID_SMOOTH_FACTOR = 0.35 # 平滑移动系数 (0.1~1.0)，越小越平滑但越慢
+HID_SMOOTH_FACTOR = 0.3 # 平滑移动系数 (0.1~1.0)，越小越平滑但越慢
 HID_UPDATE_INTERVAL = 0.003 # HID更新间隔 (秒), 0.002 = 500Hz
 
 # PID 控制参数
-PID_KP = 0.30  # 降低P值，防止因延迟导致的过冲震荡
+PID_KP = 0.25  # 降低P值，防止因延迟导致的过冲震荡
 PID_KI = 0.001   # 禁用I值
-PID_KD = 0.12  # 大幅提高D值，利用微分项预测趋势，提前刹车
+PID_KD = 0.15  # 大幅提高D值，利用微分项预测趋势，提前刹车
 PID_MAX_INTEGRAL = 0 # 积分限幅
 
 app = Flask(__name__)
@@ -60,6 +62,7 @@ hid_buffer_x = 0.0
 hid_buffer_y = 0.0
 hid_buttons = 0 # 当前按键状态
 hid_lock = threading.Lock()
+hid_cond = threading.Condition(hid_lock) # Condition variable for immediate wake-up
 pid_state = {
     'last_error_x': 0,
     'last_error_y': 0,
@@ -353,8 +356,119 @@ def draw_detections(img, dets):
 
 # --- 模型封装类 ---
 
+import ctypes
+
+# C Structure Definition
+class CDetection(ctypes.Structure):
+    _fields_ = [
+        ("x1", ctypes.c_float),
+        ("y1", ctypes.c_float),
+        ("x2", ctypes.c_float),
+        ("y2", ctypes.c_float),
+        ("score", ctypes.c_float),
+        ("class_id", ctypes.c_int)
+    ]
+
+class YOLO_RKNN_C_Wrapper:
+    def __init__(self, model_path, known_size=None):
+        self.lib = ctypes.CDLL('./c_src/librknn_yolo.so')
+        
+        # Profiling
+        self.t_pre = 0
+        self.t_infer = 0
+        self.count = 0
+        
+        # Define argument types
+        self.lib.init_model.argtypes = [ctypes.c_char_p]
+        self.lib.init_model.restype = ctypes.c_void_p
+        
+        self.lib.detect.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.POINTER(CDetection),
+            ctypes.c_int
+        ]
+        self.lib.detect.restype = ctypes.c_int
+        
+        self.lib.release_model.argtypes = [ctypes.c_void_p]
+        
+        # Init model
+        self.ctx = self.lib.init_model(model_path.encode('utf-8'))
+        if not self.ctx:
+            raise RuntimeError("Failed to init C RKNN model")
+            
+        if known_size:
+            self.model_wh = known_size
+        else:
+            # Assume 640x640 if not provided, or we could add a C function to get it
+            self.model_wh = (640, 640)
+            
+        self.results_buffer = (CDetection * 100)()
+
+    def detect(self, frame):
+        t0 = time.time()
+        # Preprocess (Letterbox)
+        if USE_RGB_INPUT:
+            input_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            input_img = frame
+            
+        lb_img, ratio, (dw, dh) = letterbox(input_img, self.model_wh)
+        
+        # Get pointer to image data
+        # Ensure contiguous array
+        if not lb_img.flags['C_CONTIGUOUS']:
+            lb_img = np.ascontiguousarray(lb_img)
+            
+        img_ptr = lb_img.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+        t1 = time.time()
+        
+        # Run inference in C
+        count = self.lib.detect(
+            self.ctx,
+            img_ptr,
+            ctypes.c_float(CONF_THRES),
+            ctypes.c_float(IOU_THRES),
+            self.results_buffer,
+            100
+        )
+        t2 = time.time()
+        
+        self.t_pre += (t1 - t0)
+        self.t_infer += (t2 - t1)
+        self.count += 1
+        if self.count % 30 == 0:
+             print(f"Avg Pre: {self.t_pre/self.count*1000:.2f}ms, Avg Infer: {self.t_infer/self.count*1000:.2f}ms")
+             self.t_pre = 0
+             self.t_infer = 0
+             self.count = 0
+        
+        if count == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+            
+        # Convert results to numpy
+        # We can optimize this by avoiding full copy if needed, but for <100 objs it's fast
+        dets = np.zeros((count, 6), dtype=np.float32)
+        for i in range(count):
+            d = self.results_buffer[i]
+            dets[i] = [d.x1, d.y1, d.x2, d.y2, d.score, float(d.class_id)]
+            
+        # Map back to original image
+        dets[:, [0, 2]] -= dw
+        dets[:, [1, 3]] -= dh
+        dets[:, :4] /= ratio
+        
+        return dets
+
+    def release(self):
+        if hasattr(self, 'ctx') and self.ctx:
+            self.lib.release_model(self.ctx)
+            self.ctx = None
+
 class YOLO_RKNN_Wrapper:
-    def __init__(self, model_path):
+    def __init__(self, model_path, known_size=None):
         from rknnlite.api import RKNNLite
         
         if not os.path.exists(model_path):
@@ -367,7 +481,10 @@ class YOLO_RKNN_Wrapper:
                 raise RuntimeError('Load RKNN model failed')
             self.rknn.init_runtime()
             
-        self.model_wh = self._probe_model_size()
+        if known_size:
+            self.model_wh = known_size
+        else:
+            self.model_wh = self._probe_model_size()
         # print(f"--> Detected RKNN model input size: {self.model_wh}")
 
     def release(self):
@@ -443,6 +560,7 @@ class MultiYOLO_RKNN_Wrapper:
         self.output_queue = Queue()
         self.running = True
         self.threads = []
+        self.init_lock = threading.Lock()
         
     def start(self):
         for i in range(self.num_threads):
@@ -450,18 +568,27 @@ class MultiYOLO_RKNN_Wrapper:
             t.daemon = True
             t.start()
             self.threads.append(t)
+            # Give some time for thread to start and acquire lock if needed
+            time.sleep(0.1)
             
     def _worker(self, thread_id):
-        print(f"Loading NPU model {thread_id+1}/{self.num_threads} in thread...")
+        print(f"Loading NPU model {thread_id+1}/{self.num_threads} in thread (C Engine)...")
         try:
             # Initialize RKNN in the worker thread context
-            wrapper = YOLO_RKNN_Wrapper(self.model_path)
-            # Ensure model size matches (it should)
-            if wrapper.model_wh != self.model_wh:
-                print(f"Warning: Model size mismatch in thread {thread_id}")
+            # Use C Wrapper
+            # Serialize initialization to prevent driver race conditions
+            with self.init_lock:
+                wrapper = YOLO_RKNN_C_Wrapper(self.model_path, known_size=self.model_wh)
+                print(f"Thread {thread_id+1} model loaded.")
         except Exception as e:
             print(f"Failed to load NPU model in thread {thread_id}: {e}")
-            return
+            # Fallback to Python wrapper if C fails?
+            try:
+                print(f"Fallback to Python wrapper for thread {thread_id}")
+                wrapper = YOLO_RKNN_Wrapper(self.model_path, known_size=self.model_wh)
+            except Exception as e2:
+                print(f"Failed to load fallback model: {e2}")
+                return
 
         while self.running:
             try:
@@ -629,6 +756,7 @@ def process_hid_logic(dets, center_x, center_y):
             with hid_lock:
                 hid_buffer_x += final_dx
                 hid_buffer_y += final_dy
+                hid_cond.notify() # Wake up HID worker immediately
     else:
         # Reset PID integral when no target found to prevent windup
         pid_state['integral_x'] = 0
@@ -655,6 +783,12 @@ def hid_worker():
             continue
             
         with hid_lock:
+            # Wait for notification or timeout
+            # If buffer is empty, wait longer (save CPU)
+            # If buffer has data, process immediately
+            if abs(hid_buffer_x) < 0.1 and abs(hid_buffer_y) < 0.1:
+                 hid_cond.wait(timeout=0.01)
+            
             # Simple Proportional smoothing
             # Move a fraction of the remaining distance
             step_x = hid_buffer_x * HID_SMOOTH_FACTOR
@@ -694,7 +828,8 @@ def hid_worker():
             except Exception:
                 pass
         
-        time.sleep(HID_UPDATE_INTERVAL)
+        # Short sleep to limit polling rate (e.g. 1000Hz)
+        time.sleep(0.001)
 
 # --- 异步绘图模块 ---
 vis_queue = Queue(maxsize=2)
@@ -744,6 +879,11 @@ def detection_loop():
             cap = temp_cap
             # 尝试设置缓冲区大小为1，减少摄像头内部延迟
             try:
+                # 必须先设置格式，再设置分辨率和帧率
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+                # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                # cap.set(cv2.CAP_PROP_FPS, 60)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except:
                 pass
@@ -758,7 +898,7 @@ def detection_loop():
     center_x = (actual_width / 2) + AIM_OFFSET_X
     center_y = (actual_height / 2) + AIM_OFFSET_Y
     
-    # print(f"Camera resolution: {actual_width}x{actual_height}")
+    print(f"Camera resolution: {actual_width}x{actual_height}")
 
     # Start async wrapper if applicable
     if hasattr(model_wrapper, 'start'):
@@ -767,6 +907,9 @@ def detection_loop():
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
+    
+    cam_fps_counter = 0
+    cam_fps_start_time = time.time()
     
     frame_id_counter = 0
     last_processed_frame_id = -1
@@ -816,31 +959,47 @@ def detection_loop():
         vis = None
         frame_id_counter += 1
         
+        cam_fps_counter += 1
+        if time.time() - cam_fps_start_time >= 1.0:
+            cam_fps = cam_fps_counter / (time.time() - cam_fps_start_time)
+            print(f"Camera FPS: {cam_fps:.2f}")
+            cam_fps_counter = 0
+            cam_fps_start_time = time.time()
+        
         if hasattr(model_wrapper, 'detect_async'):
-            model_wrapper.detect_async(frame.copy(), frame_id_counter) # Pass copy to avoid race condition if frame buffer reused
+            model_wrapper.detect_async(frame, frame_id_counter) # Pass frame directly (assuming cap.read returns new buffer)
             
-            # Process all available results
+            # Process all available results, but only act on the latest one
+            best_res = None
             while True:
                 fid, res_frame, dets = model_wrapper.get_result()
                 if res_frame is None:
                     break
                 
-                # Only process if newer than last processed frame
+                # Keep track of the latest frame result
                 if fid > last_processed_frame_id:
-                    # 1. HID Control (Critical Path)
-                    process_hid_logic(dets, center_x, center_y)
-                    last_processed_frame_id = fid
-                    
-                    # Calculate FPS (based on processed frames)
-                    fps_counter += 1
-                    if time.time() - fps_start_time >= 1.0:
-                        fps = fps_counter / (time.time() - fps_start_time)
-                        fps_counter = 0
-                        fps_start_time = time.time()
-                    
-                    # 2. Visualization (Async)
-                    if not vis_queue.full():
-                        vis_queue.put((res_frame, dets, center_x, center_y, fps))
+                    if best_res is None or fid > best_res[0]:
+                        best_res = (fid, res_frame, dets)
+            
+            # If we found a newer result, process it
+            if best_res:
+                fid, res_frame, dets = best_res
+                
+                # 1. HID Control (Critical Path)
+                process_hid_logic(dets, center_x, center_y)
+                last_processed_frame_id = fid
+                
+                # Calculate FPS (based on processed frames)
+                fps_counter += 1
+                if time.time() - fps_start_time >= 1.0:
+                    fps = fps_counter / (time.time() - fps_start_time)
+                    fps_counter = 0
+                    fps_start_time = time.time()
+                    print(f"Process FPS: {fps:.2f}")
+                
+                # 2. Visualization (Async)
+                if not vis_queue.full():
+                    vis_queue.put((res_frame, dets, center_x, center_y, fps))
 
         else:
             dets = model_wrapper.detect(frame)
@@ -1115,7 +1274,8 @@ if __name__ == '__main__':
     # 初始化模型
     if MODEL_PATH.endswith('.rknn'):
         # Use Multi-NPU wrapper for RKNN models
-        model_wrapper = MultiYOLO_RKNN_Wrapper(MODEL_PATH, num_threads=3)
+        # Try increasing threads to saturate NPU
+        model_wrapper = MultiYOLO_RKNN_Wrapper(MODEL_PATH, num_threads=6)
     elif MODEL_PATH.endswith('.pt'):
         model_wrapper = YOLO_CPU_Wrapper(MODEL_PATH)
     else:
