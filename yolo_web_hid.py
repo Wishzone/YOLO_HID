@@ -18,7 +18,7 @@ MODEL_PATH = './Models/cf-11n-rk3588.rknn'
 CONF_THRES = 0.5
 IOU_THRES = 0.4
 USE_RGB_INPUT = True # INT8 模型通常需要 BGR 输入，如果识别不准请尝试改为 True
-CAMERA_INDEXES = [21, 20, 11, 0]
+CAMERA_INDEXES = [20] # 仅使用 HDMI IN
 PORT = 5000
 TARGET_CLASS_ID = 0
 ENABLE_HID = True # 是否启用HID控制
@@ -873,14 +873,15 @@ def detection_loop():
     cap = None
     
     for idx in CAMERA_INDEXES:
-        temp_cap = cv2.VideoCapture(idx)
+        # 针对 HDMI IN 优化：使用 V4L2 后端
+        temp_cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if temp_cap.isOpened():
             # print(f"Opened camera index {idx}")
             cap = temp_cap
             # 尝试设置缓冲区大小为1，减少摄像头内部延迟
             try:
-                # 必须先设置格式，再设置分辨率和帧率
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+                # HDMI IN 原生支持 BGR3 格式，直接采集 BGR 数据，避免 MJPG 解码和 YUV 转换，延迟最低
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('B', 'G', 'R', '3'))
                 # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                 # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                 # cap.set(cv2.CAP_PROP_FPS, 60)
