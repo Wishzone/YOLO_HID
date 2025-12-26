@@ -22,11 +22,11 @@ except Exception as e:
 
 # --- 配置参数 ---
 MODEL_PATH = './Models/cf-11n-rk3588-int8.rknn'
-CONF_THRES = 0.5  # Lower threshold to catch weak detections
+CONF_THRES = 0.45  # Lower threshold to catch weak detections
 USE_RGB_INPUT = True 
 CAMERA_INDEX = 20 # HDMI IN
 PORT = 5000
-TARGET_CLASS_ID = 0
+TARGET_CLASS_ID = 1
 
 # HID / 键鼠控制配置
 ENABLE_HID = True
@@ -39,9 +39,9 @@ HID_UPDATE_INTERVAL = 0.003
 # 自动射击配置
 AUTO_SHOOT = True
 SHOOT_COOLDOWN = 0.03
-SHOOT_THRESHOLD = 30
+SHOOT_THRESHOLD = 20
 SHOOT_DURATION = 0.02
-SHOOT_PREDICTION = 9
+SHOOT_PREDICTION = 6
 SHOOT_SUSTAIN_TIME = 0
 RECOIL_STRENGTH = 3.0
 
@@ -52,7 +52,7 @@ AIM_DEADZONE = 0
 AIM_HEIGHT_RATIO = 0.10
 
 # PID 参数
-PID_KP = 0.25
+PID_KP = 0.35
 PID_KI = 0.001
 PID_KD = 0.15
 PID_MAX_INTEGRAL = 0
