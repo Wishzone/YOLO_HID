@@ -4,7 +4,7 @@ import numpy as np
 import argparse
 from rknn.api import RKNN
 
-def generate_dataset_list(dataset_path, output_file, num_images=50):
+def generate_dataset_list(dataset_path, output_file, num_images=100):
     if not os.path.exists(dataset_path):
         print(f"Dataset path {dataset_path} does not exist!")
         sys.exit(1)
@@ -43,10 +43,10 @@ if __name__ == '__main__':
     print('--> Config model')
     # IMPORTANT: Ultralytics YOLOv8/11 ONNX export typically includes the normalization (div by 255) inside the model.
     # Therefore, we should NOT normalize again in RKNN config.
-    # Use mean=0, std=1 to pass 0-255 values directly to the model.
-    # If your ONNX model expects 0-1 input (does NOT have div layer), change std to 255.
-    rknn.config(mean_values=[[0, 0, 0]], std_values=[[1, 1, 1]], target_platform=args.platform, 
-                quantized_dtype='asymmetric_quantized-8', quantized_algorithm='normal')
+    # Use mean=0, std=255 to normalize 0-255 input to 0-1.
+    # This is required if the ONNX model does NOT have a Div(255) layer.
+    rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]], target_platform=args.platform, 
+                quantized_dtype='asymmetric_quantized-8', quantized_algorithm='kl_divergence')
     print('done')
 
     # Load ONNX model

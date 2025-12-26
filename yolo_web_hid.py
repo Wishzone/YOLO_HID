@@ -21,8 +21,8 @@ except Exception as e:
     print(f"[System] Failed to set CPU affinity: {e}")
 
 # --- 配置参数 ---
-MODEL_PATH = './Models/cf-11n-rk3588.rknn'
-CONF_THRES = 0.5
+MODEL_PATH = './Models/cf-11n-rk3588-int8.rknn'
+CONF_THRES = 0.5  # Lower threshold to catch weak detections
 USE_RGB_INPUT = True 
 CAMERA_INDEX = 20 # HDMI IN
 PORT = 5000

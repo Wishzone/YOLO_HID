@@ -7,9 +7,7 @@
 #include <rknn_api.h>
 
 #define MAX_DETECTIONS 100
-// NUM_CLASS is now dynamic
-// #define NUM_CLASS 80 
-#define NUM_ANCHORS 8400
+#define DFL_REG 16
 
 typedef struct {
     float x1, y1, x2, y2;
@@ -26,6 +24,33 @@ typedef struct {
     int model_width;
     int model_height;
 } RKNN_Context;
+
+// Softmax for DFL
+float dfl_softmax_integral(float* src) {
+    float exp_sum = 0.0f;
+    float exps[DFL_REG];
+    float max_val = -10000.0f;
+    
+    for(int i=0; i<DFL_REG; i++) {
+        if(src[i] > max_val) max_val = src[i];
+    }
+    
+    for(int i=0; i<DFL_REG; i++) {
+        exps[i] = expf(src[i] - max_val);
+        exp_sum += exps[i];
+    }
+    
+    float result = 0.0f;
+    for(int i=0; i<DFL_REG; i++) {
+        result += (exps[i] / exp_sum) * i;
+    }
+    return result;
+}
+
+// Sigmoid
+float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
 
 // NMS Helper
 float iou(Detection* a, Detection* b) {
@@ -205,14 +230,6 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
     if (!ctx || !ctx->is_init) return 0;
 
-    static int frame_count = 0;
-    frame_count++;
-    // bool debug_print = (frame_count % 60 == 0); // Print every 60 frames
-    bool debug_print = false; // Disable debug prints for cleaner output
-
-    struct timeval start_time, stop_time;
-    double time_diff;
-
     int ret;
     rknn_input inputs[1];
     memset(inputs, 0, sizeof(inputs));
@@ -223,35 +240,24 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
     inputs[0].pass_through = 0;
     inputs[0].buf = img_data;
 
-    // Debug Input Data
-    if (debug_print) {
-        printf("Input Center Pixel: R=%d G=%d B=%d\n", 
-            img_data[ctx->model_height/2 * ctx->model_width * 3 + ctx->model_width/2 * 3 + 0],
-            img_data[ctx->model_height/2 * ctx->model_width * 3 + ctx->model_width/2 * 3 + 1],
-            img_data[ctx->model_height/2 * ctx->model_width * 3 + ctx->model_width/2 * 3 + 2]);
-    }
-
     ret = rknn_inputs_set(ctx->ctx, ctx->io_num.n_input, inputs);
     if (ret < 0) {
         printf("rknn_inputs_set failed\n");
         return 0;
     }
 
-    gettimeofday(&start_time, NULL);
     ret = rknn_run(ctx->ctx, NULL);
-    gettimeofday(&stop_time, NULL);
-    if (debug_print) {
-        printf("rknn_run: %f ms\n", (stop_time.tv_sec - start_time.tv_sec) * 1000.0 + (stop_time.tv_usec - start_time.tv_usec) / 1000.0);
-    }
-
     if (ret < 0) {
         printf("rknn_run failed\n");
         return 0;
     }
 
-    rknn_output outputs[1];
+    // Support up to 3 outputs
+    rknn_output outputs[3];
     memset(outputs, 0, sizeof(outputs));
-    outputs[0].want_float = 1;
+    for(int i=0; i<ctx->io_num.n_output; i++) {
+        outputs[i].want_float = 1;
+    }
     
     ret = rknn_outputs_get(ctx->ctx, ctx->io_num.n_output, outputs, NULL);
     if (ret < 0) {
@@ -259,136 +265,182 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
         return 0;
     }
 
-    // Post Process
-    float* output_data = (float*)outputs[0].buf;
-    
-    // Determine shape from attributes or output
-    // We assume single output for YOLOv8/11
-    int dim0 = ctx->output_attrs[0].dims[0]; // Batch (1)
-    int dim1 = ctx->output_attrs[0].dims[1]; // 84 or 8400
-    int dim2 = ctx->output_attrs[0].dims[2]; // 8400 or 84
-    
-    int rows, cols;
-    bool transposed = false;
-
-    // Standard YOLOv8 export: [1, 84, 8400] -> 84 rows (features), 8400 cols (anchors)
-    // We want to iterate over anchors (cols)
-    
-    if (dim1 < dim2) {
-        rows = dim1; // 84 (or 6)
-        cols = dim2; // 8400
-    } else {
-        rows = dim1; // 8400
-        cols = dim2; // 84 (or 6)
-        transposed = true; // Need to handle [1, 8400, 84]
-    }
-    
-    int num_classes;
-    if (!transposed) {
-        num_classes = rows - 4;
-    } else {
-        num_classes = cols - 4;
-    }
-
-    // Safety check
-    if (num_classes <= 0) {
-            printf("Unexpected output shape: rows=%d, cols=%d, transposed=%d\n", rows, cols, transposed);
-            rknn_outputs_release(ctx->ctx, ctx->io_num.n_output, outputs);
-            return 0;
-    }
-
     int det_count = 0;
     Detection local_dets[MAX_DETECTIONS];
 
-    gettimeofday(&start_time, NULL);
-
-    if (!transposed) {
-        // Shape: [rows, cols] e.g. [6, 8400]
-        // Data layout: row0_col0, row0_col1, ... row1_col0 ...
-        // We want to access: for each anchor i (0..8399)
-        // cx = data[0 * cols + i]
-        // cy = data[1 * cols + i]
-        // ...
-        // score = data[(4+c) * cols + i]
-        
-        for (int i = 0; i < cols; i++) {
-            // Find max class score
-            float max_score = 0;
-            int class_id = -1;
+    // Check if it's a multi-head output (3 outputs)
+    if (ctx->io_num.n_output == 3) {
+        for (int i = 0; i < 3; i++) {
+            float* output_data = (float*)outputs[i].buf;
+            int h, w, c;
+            int fmt = ctx->output_attrs[i].fmt;
             
-            for (int c = 0; c < num_classes; c++) {
-                float score = output_data[(4 + c) * cols + i];
-                if (score > max_score) {
-                    max_score = score;
-                    class_id = c;
+            // Robust dimension detection
+            if (fmt == RKNN_TENSOR_NHWC) {
+                h = ctx->output_attrs[i].dims[1];
+                w = ctx->output_attrs[i].dims[2];
+                c = ctx->output_attrs[i].dims[3];
+            } else {
+                // NCHW
+                c = ctx->output_attrs[i].dims[1];
+                h = ctx->output_attrs[i].dims[2];
+                w = ctx->output_attrs[i].dims[3];
+            }
+            
+            // Calculate stride dynamically based on model width (640)
+            // Assuming square model
+            int stride = ctx->model_width / w;
+
+            // Debug first frame only
+            static bool printed_info = false;
+            if (!printed_info) {
+                printf("[RKNN] Output %d: fmt=%d (0=NCHW, 1=NHWC), dims=[%d, %d, %d, %d] -> h=%d, w=%d, c=%d, stride=%d\n", 
+                       i, fmt, 
+                       ctx->output_attrs[i].dims[0], ctx->output_attrs[i].dims[1], 
+                       ctx->output_attrs[i].dims[2], ctx->output_attrs[i].dims[3],
+                       h, w, c, stride);
+            }
+
+            // Check if dimensions match expectation
+            if (c != 66) {
+                // Try to adapt if it's not 66
+                // If c is 80 or 40, maybe we parsed dims wrong?
+                if (h == 66) { // Swap H and C?
+                     int temp = h; h = c; c = temp;
+                     // If we swapped, we might need to change reading logic, but let's assume fmt was wrong
+                     // But let's just warn for now
+                     if (!printed_info) printf("[RKNN] Warning: c=%d, expected 66. Maybe dims are swapped?\n", c);
                 }
             }
+            int num_classes = c - 64;
+            
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    // Find max class score first to filter
+                    float max_score = 0;
+                    int class_id = -1;
+                    
+                    // Class scores start at offset 64
+                    for (int cls = 0; cls < num_classes; cls++) {
+                        float score;
+                        if (fmt == RKNN_TENSOR_NHWC) {
+                            score = output_data[y * w * c + x * c + (64 + cls)];
+                        } else {
+                            score = output_data[(64 + cls) * h * w + y * w + x];
+                        }
+                        
+                        score = sigmoid(score); // Apply sigmoid
+                        if (score > max_score) {
+                            max_score = score;
+                            class_id = cls;
+                        }
+                    }
+                    
+                    if (max_score > conf_thres) {
+                        if (det_count >= MAX_DETECTIONS) break;
+                        
+                        // Decode DFL
+                        float dist[4]; // left, top, right, bottom
+                        float dfl_buf[16];
+                        
+                        for(int d=0; d<4; d++) {
+                            for(int k=0; k<16; k++) {
+                                if (fmt == RKNN_TENSOR_NHWC) {
+                                    dfl_buf[k] = output_data[y * w * c + x * c + (d * 16 + k)];
+                                } else {
+                                    dfl_buf[k] = output_data[(d * 16 + k) * h * w + y * w + x];
+                                }
+                            }
+                            dist[d] = dfl_softmax_integral(dfl_buf);
+                        }
+                        
+                        float anchor_cx = (x + 0.5f) * stride;
+                        float anchor_cy = (y + 0.5f) * stride;
+                        
+                        float x1 = anchor_cx - dist[0] * stride;
+                        float y1 = anchor_cy - dist[1] * stride;
+                        float x2 = anchor_cx + dist[2] * stride;
+                        float y2 = anchor_cy + dist[3] * stride;
+                        
+                        local_dets[det_count].x1 = x1;
+                        local_dets[det_count].y1 = y1;
+                        local_dets[det_count].x2 = x2;
+                        local_dets[det_count].y2 = y2;
+                        local_dets[det_count].score = max_score;
+                        local_dets[det_count].class_id = class_id;
+                        det_count++;
 
-            // Debug print for the first few anchors
-            if (debug_print && i < 5) {
-                printf("Anchor %d: cx=%f, cy=%f, w=%f, h=%f, s0=%f, s1=%f\n", 
-                       i, 
-                       output_data[0*cols+i], 
-                       output_data[1*cols+i], 
-                       output_data[2*cols+i], 
-                       output_data[3*cols+i], 
-                       output_data[4*cols+i], 
-                       output_data[5*cols+i]);
+                        if (!printed_info && det_count < 5) {
+                             printf("[RKNN] Det: cls=%d, score=%.2f, box=[%.1f, %.1f, %.1f, %.1f] grid=(%d,%d) stride=%d\n",
+                                    class_id, max_score, x1, y1, x2, y2, x, y, stride);
+                        }
+                    }
+                }
             }
-
-            if (max_score > conf_thres) {
-                if (det_count >= MAX_DETECTIONS) break;
-
-                float cx = output_data[0 * cols + i];
-                float cy = output_data[1 * cols + i];
-                float w = output_data[2 * cols + i];
-                float h = output_data[3 * cols + i];
-
-                local_dets[det_count].x1 = cx - w / 2;
-                local_dets[det_count].y1 = cy - h / 2;
-                local_dets[det_count].x2 = cx + w / 2;
-                local_dets[det_count].y2 = cy + h / 2;
-                local_dets[det_count].score = max_score;
-                local_dets[det_count].class_id = class_id;
-                det_count++;
-            }
+            if (!printed_info && i == 2) printed_info = true;
         }
     } else {
-        // Shape: [rows, cols] e.g. [8400, 6]
-        // Data layout: anchor0_feat0, anchor0_feat1 ...
-        // stride = cols (6)
-        int stride = cols; 
-        int num_anchors = rows; // 8400
+        // Fallback to single output logic (if user switches back)
+        // ... (Existing logic for single output)
+        float* output_data = (float*)outputs[0].buf;
+        int dim1 = ctx->output_attrs[0].dims[1];
+        int dim2 = ctx->output_attrs[0].dims[2];
+        int rows, cols;
+        bool transposed = false;
+        if (dim1 < dim2) { rows = dim1; cols = dim2; } 
+        else { rows = dim1; cols = dim2; transposed = true; }
+        int num_classes = (!transposed ? rows : cols) - 4;
         
-        for (int i = 0; i < num_anchors; i++) {
-            float* ptr = output_data + i * stride;
-            
-            float max_score = 0;
-            int class_id = -1;
-            
-            for (int c = 0; c < num_classes; c++) {
-                float score = ptr[4 + c];
-                if (score > max_score) {
-                    max_score = score;
-                    class_id = c;
+        if (num_classes > 0) {
+             if (!transposed) {
+                for (int i = 0; i < cols; i++) {
+                    float max_score = 0;
+                    int class_id = -1;
+                    for (int c = 0; c < num_classes; c++) {
+                        float score = output_data[(4 + c) * cols + i];
+                        if (score > max_score) { max_score = score; class_id = c; }
+                    }
+                    if (max_score > conf_thres) {
+                        if (det_count >= MAX_DETECTIONS) break;
+                        float cx = output_data[0 * cols + i];
+                        float cy = output_data[1 * cols + i];
+                        float w = output_data[2 * cols + i];
+                        float h = output_data[3 * cols + i];
+                        local_dets[det_count].x1 = cx - w / 2;
+                        local_dets[det_count].y1 = cy - h / 2;
+                        local_dets[det_count].x2 = cx + w / 2;
+                        local_dets[det_count].y2 = cy + h / 2;
+                        local_dets[det_count].score = max_score;
+                        local_dets[det_count].class_id = class_id;
+                        det_count++;
+                    }
                 }
-            }
-            
-            if (max_score > conf_thres) {
-                if (det_count >= MAX_DETECTIONS) break;
-                
-                float cx = ptr[0];
-                float cy = ptr[1];
-                float w = ptr[2];
-                float h = ptr[3];
-                
-                local_dets[det_count].x1 = cx - w / 2;
-                local_dets[det_count].y1 = cy - h / 2;
-                local_dets[det_count].x2 = cx + w / 2;
-                local_dets[det_count].y2 = cy + h / 2;
-                local_dets[det_count].score = max_score;
-                local_dets[det_count].class_id = class_id;
-                det_count++;
+            } else {
+                int stride = cols; 
+                int num_anchors = rows;
+                for (int i = 0; i < num_anchors; i++) {
+                    float* ptr = output_data + i * stride;
+                    float max_score = 0;
+                    int class_id = -1;
+                    for (int c = 0; c < num_classes; c++) {
+                        float score = ptr[4 + c];
+                        if (score > max_score) { max_score = score; class_id = c; }
+                    }
+                    if (max_score > conf_thres) {
+                        if (det_count >= MAX_DETECTIONS) break;
+                        float cx = ptr[0];
+                        float cy = ptr[1];
+                        float w = ptr[2];
+                        float h = ptr[3];
+                        local_dets[det_count].x1 = cx - w / 2;
+                        local_dets[det_count].y1 = cy - h / 2;
+                        local_dets[det_count].x2 = cx + w / 2;
+                        local_dets[det_count].y2 = cy + h / 2;
+                        local_dets[det_count].score = max_score;
+                        local_dets[det_count].class_id = class_id;
+                        det_count++;
+                    }
+                }
             }
         }
     }
@@ -398,11 +450,6 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
     // NMS
     nms(local_dets, &det_count, nms_thres);
     
-    gettimeofday(&stop_time, NULL);
-    if (debug_print) {
-        printf("PostProcess: %f ms, Dets: %d\n", (stop_time.tv_sec - start_time.tv_sec) * 1000.0 + (stop_time.tv_usec - start_time.tv_usec) / 1000.0, det_count);
-    }
-
     // Copy to output buffer
     int final_count = (det_count < max_results) ? det_count : max_results;
     for(int i=0; i<final_count; i++) {
