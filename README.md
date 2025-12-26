@@ -1,138 +1,102 @@
 # YOLO11n RK3588 AI 助手
 
-这是一个专为 Rockchip RK3588 平台（如 NanoPC-T6）打造的高性能 YOLO 目标检测与自动辅助系统。项目利用 RK3588 强大的 NPU 进行 3 核心并行推理，实现高帧率的目标检测，并通过 USB HID 接口模拟鼠标进行智能辅助操作。
+这是一个专为 Rockchip RK3588 平台（如 NanoPC-T6, Orange Pi 5）打造的高性能 YOLO 目标检测与自动辅助系统。项目利用 RK3588 强大的 NPU 进行硬件加速推理，结合 C 语言底层优化，实现高帧率目标检测，并通过 USB HID 接口模拟鼠标进行智能辅助操作。
 
 ## ✨ 主要功能
 
-*   **🚀 极致性能**: 利用 RK3588 的 3 个 NPU 核心进行多线程并行推理，大幅提升 FPS。
-*   **👁️ 实时监控**: 内置 Flask Web 服务器，通过浏览器实时查看低延迟的检测画面 (MJPEG 流)。
-*   **🎯 智能瞄准**: 
-    *   集成 **PID 控制算法**，实现平滑、精准的鼠标移动，拒绝机械式卡顿。
-    *   支持 **动态死区** 和 **灵敏度调节**。
-*   **🔥 自动射击**: 当准星锁定目标时，自动触发鼠标左键点击（支持冷却时间配置）。
-*   **⚡ 高效传输**: 
-    *   直接操作 `/dev/hidg1` 设备文件，无缓冲写入，延迟极低。
-    *   优化了 Web 视频流编码，降低 CPU 占用。
-*   **🛠️ 广泛兼容**: 支持 YOLOv5, YOLOv8, YOLOv10, YOLOv11 的 RKNN 模型。
+*   **🚀 极致性能**: 
+    *   利用 RK3588 NPU 进行 INT8 量化推理。
+    *   底层后处理算法采用 C 语言编写 (`c_src`), 大幅降低 Python 开销。
+    *   多线程异步处理视频流与推理。
+*   **👁️ 实时监控**: 内置 Flask Web 服务器，通过浏览器 (端口 5000) 实时查看低延迟检测画面。
+*   **🎮 硬件级模拟**: 
+    *   通过 Linux USB Gadget API (`/dev/hidg1`) 模拟物理鼠标，无需软件驱动，难以被检测。
+    *   支持动态 PID 控制算法，实现平滑、拟人的瞄准轨迹。
+*   **🔥 智能辅助**: 
+    *   **自动瞄准**: 自动吸附目标，支持动态死区和灵敏度调节。
+    *   **自动射击**: 锁定目标后自动触发点击，支持冷却时间和后坐力补偿。
+*   **🛠️ 广泛兼容**: 支持 YOLOv5, YOLOv8, YOLOv10, YOLOv11 等多种架构的 RKNN 模型。
 
 ## 🛠️ 硬件与环境要求
 
 *   **开发板**: Rockchip RK3588 系列 (推荐 NanoPC-T6, Orange Pi 5 等)。
-*   **摄像头**: USB 摄像头 (支持 MJPEG 格式更佳)。
 *   **连接**: 开发板 OTG 接口需连接到目标主机（PC/游戏机）以模拟鼠标。
-*   **系统**: Linux (Ubuntu/Debian/Armbian)。
-*   **Python**: Python 3.8+ (建议使用 Conda 环境)。
+*   **摄像头**: HDMI 输入或 USB 摄像头 (支持 MJPEG 格式更佳)。
+*   **系统**: Linux (Ubuntu/Debian/Armbian) with Rockchip kernel 5.10+。
 
-## 📦 安装依赖
+## 📦 安装步骤
 
-建议在 Conda 环境中运行：
-
+### 1. 克隆项目
 ```bash
-# 激活环境
+git clone <repository_url>
+cd YOLO11n
+```
+
+### 2. 安装 Python 依赖
+建议使用 Conda 环境管理依赖：
+```bash
+conda create -n rknn python=3.9
 conda activate rknn
 
-# 安装基础依赖
+# 安装基础库
 pip install flask opencv-python numpy
 
-# 安装 RKNN Lite2 (用于 NPU 推理)
-# 请从 Rockchip 官方仓库下载对应 Python 版本的 whl 包安装
-pip install rknn_toolkit_lite2-*.whl
-
-# (可选) 如果需要调试 .pt 模型
-pip install ultralytics
+# 安装 RKNN Toolkit Lite2
+# 请前往 Rockchip 官方仓库下载适配你 Python 版本的 .whl 文件
+# 例如: pip install rknn_toolkit_lite2-2.0.0b0-cp39-cp39-linux_aarch64.whl
 ```
 
-## ⚙️ USB HID 配置 (关键)
-
-本项目依赖 Linux USB Gadget API 来模拟鼠标。在运行程序前，必须确保 `/dev/hidg1` 设备存在。
-
-如果你的系统中没有该设备，请创建一个启动脚本 `hid_setup.sh` 并以 root 权限运行：
-
+### 3. 编译 C 加速库 (必须)
+本项目使用 C 语言处理 NPU 输出以提升性能，必须先编译共享库：
 ```bash
-#!/bin/bash
-# 配置 USB Gadget 为鼠标设备
-
-CONFIGFS_HOME=/sys/kernel/config/usb_gadget
-GADGET_NAME=rknn_mouse
-LANG=0x409
-
-modprobe libcomposite
-
-mkdir -p ${CONFIGFS_HOME}/${GADGET_NAME}
-cd ${CONFIGFS_HOME}/${GADGET_NAME}
-
-echo 0x1d6b > idVendor  # Linux Foundation
-echo 0x0104 > idProduct # Multifunction Composite Gadget
-echo 0x0100 > bcdDevice
-echo 0x0200 > bcdUSB
-
-mkdir -p strings/${LANG}
-echo "RKNN-AI" > strings/${LANG}/manufacturer
-echo "AI-Mouse" > strings/${LANG}/product
-echo "12345678" > strings/${LANG}/serialnumber
-
-# 配置 HID 功能
-mkdir -p functions/hid.usb0
-echo 1 > functions/hid.usb0/protocol
-echo 1 > functions/hid.usb0/subclass
-echo 8 > functions/hid.usb0/report_length
-# 写入鼠标报告描述符
-echo -ne \\x05\\x01\\x09\\x02\\xa1\\x01\\x09\\x01\\xa1\\x00\\x05\\x09\\x19\\x01\\x29\\x03\\x15\\x00\\x25\\x01\\x95\\x03\\x75\\x01\\x81\\x02\\x95\\x01\\x75\\x05\\x81\\x03\\x05\\x01\\x09\\x30\\x09\\x31\\x09\\x38\\x15\\x81\\x25\\x7f\\x75\\x08\\x95\\x03\\x81\\x06\\xc0\\xc0 > functions/hid.usb0/report_desc
-
-mkdir -p configs/c.1/strings/${LANG}
-echo "Config 1" > configs/c.1/strings/${LANG}/configuration
-echo 250 > configs/c.1/MaxPower
-
-# 关联功能
-ln -s functions/hid.usb0 configs/c.1/
-
-# 启用 Gadget (请根据实际 UDC 名称修改，通常是 fc000000.usb 或类似)
-ls /sys/class/udc > UDC
-chmod 777 /dev/hidg0 2>/dev/null || true
-chmod 777 /dev/hidg1 2>/dev/null || true
+cd c_src
+make
+cd ..
+# 编译成功后，应在 c_src 目录下看到 librknn_yolo.so
 ```
 
-## 🚀 运行项目
+## 🚀 运行指南
 
-1.  **准备模型**:
-    将转换好的 `.rknn` 模型放入 `Models/` 目录。
-    修改 `yolo_web_hid.py` 中的 `MODEL_PATH` 变量指向你的模型。
-
-2.  **启动脚本**:
-
-    ```bash
-    # 建议使用 sudo 以确保有权限访问 /dev/hidg1 和 摄像头
-    sudo /home/pi/anaconda3/envs/rknn/bin/python yolo_web_hid.py
-    ```
-
-3.  **访问 Web 界面**:
-    在浏览器中访问: `http://<开发板IP>:5000`
-
-## 🔧 参数调优
-
-在 `yolo_web_hid.py` 顶部可以调整核心参数：
-
-```python
-# 核心配置
-CONF_THRES = 0.7         # 置信度阈值
-TARGET_CLASS_ID = 0      # 目标类别 ID (0 通常是人)
-ENABLE_HID = True        # 总开关
-
-# 瞄准参数
-AIM_OFFSET_X = 5         # 准星横向偏移校准
-AIM_HEIGHT_RATIO = 0.10  # 瞄准高度 (0.0=头顶, 0.5=中心)
-MOUSE_SENSITIVITY = 0.8  # 鼠标移动灵敏度
-
-# 自动射击
-AUTO_SHOOT = True        # 启用自动射击
-SHOOT_THRESHOLD = 15     # 触发范围 (像素)
-SHOOT_COOLDOWN = 0.2     # 射击冷却 (秒)
-
-# PID 控制 (平滑移动)
-PID_KP = 0.65            # 比例系数 (响应速度)
-PID_KD = 0.40            # 微分系数 (阻尼/防抖)
+### 1. 系统初始化 (每次重启后需运行)
+运行 `setup.sh` 脚本以配置 USB HID 设备 (`/dev/hidg1`) 并开启 CPU/NPU 高性能模式。
+```bash
+sudo ./setup.sh
 ```
+> **注意**: 此脚本需要 root 权限，且必须在连接 OTG 线缆的情况下运行，否则主机无法识别模拟鼠标。
 
-## ⚠️ 免责声明
+### 2. 运行主程序
+```bash
+sudo python3 yolo_web_hid.py
+```
+*   程序默认监听 HDMI IN (Camera Index 20)，如需更改请编辑 `yolo_web_hid.py` 中的 `CAMERA_INDEX`。
+*   默认加载模型: `./Models/cf-11n-rk3588-int8.rknn`。
 
-本项目仅供计算机视觉与嵌入式系统学习研究使用。请勿用于任何违反游戏公平性或法律法规的用途。作者不对使用本项目造成的任何后果负责。
+### 3. Web 控制台
+程序启动后，在浏览器访问开发板 IP：
+`http://<开发板IP>:5000`
+*   查看实时推理画面。
+*   (未来功能) 动态调整灵敏度、阈值等参数。
+
+## 📂 文件结构说明
+
+*   `yolo_web_hid.py`: 主程序，包含 Web 服务、推理循环和 HID 控制逻辑。
+*   `setup.sh`: 系统初始化脚本，配置 USB Gadget 和性能模式。
+*   `check_model.py`: 用于检查 RKNN 模型详细信息的工具。
+*   `c_src/`: C 语言源码目录，包含 NPU 后处理加速代码。
+    *   `yolo_rknn.c`: 后处理实现。
+    *   `Makefile`: 编译脚本。
+*   `Models/`: 存放转换好的 `.rknn` 模型文件。
+
+## 🔧 常见问题
+
+**Q: 运行提示 `OSError: ./c_src/librknn_yolo.so: cannot open shared object file`**
+A: 请确保你已经进入 `c_src` 目录并执行了 `make` 命令。
+
+**Q: 提示找不到 `/dev/hidg1`**
+A: 请确保已使用 `sudo` 运行了 `setup.sh`，并且开发板的 OTG 接口已正确连接到电脑。
+
+**Q: 帧率很低**
+A: 
+1. 确保运行了 `setup.sh` 开启高性能模式。
+2. 检查摄像头输入分辨率，推荐 1080p 或 720p。
+3. 确保使用的是 INT8 量化的 RKNN 模型。
