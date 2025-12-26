@@ -12,6 +12,14 @@ import atexit
 from flask import Flask, Response, request, jsonify
 from queue import Queue
 
+# --- CPU 亲和性设置 (RK3588 A76 Big Cores) ---
+try:
+    # RK3588: 0-3=A55, 4-7=A76. Bind to 4,5,6,7
+    os.sched_setaffinity(0, {4, 5, 6, 7})
+    print("[System] Process bound to A76 Big Cores (4-7)")
+except Exception as e:
+    print(f"[System] Failed to set CPU affinity: {e}")
+
 # --- 配置参数 ---
 MODEL_PATH = './Models/cf-11n-rk3588.rknn'
 CONF_THRES = 0.5
