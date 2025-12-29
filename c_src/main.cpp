@@ -20,20 +20,21 @@
 #define NMS_THRES 0.45f
 
 // 控制参数
-float PID_KP = 0.5f;
-float PID_KD = 0.05f;
+float PID_KP = 0.55f;
+float PID_KD = 0.3f;
 float MOUSE_SENSITIVITY = 0.4f;
-float HID_SMOOTH_FACTOR = 0.3f;
+float HID_SMOOTH_FACTOR = 0.25f;
 float AIM_DEADZONE = 0.0f; 
-float SHOOT_THRES = 20.0f;
+float SHOOT_THRES = 15.0f;
 float AIM_HEIGHT_RATIO = 0.12f; // 瞄准高度偏移 (头部)
+float SHOOT_PREDICTION = 12.0f; // 射击预测帧数
 
 // 全局状态
 std::atomic<bool> running(true);
 int hid_fd = -1;
 
 // HID Buffer & 锁
-float hid_buffer_x = 0.0f;
+float hid_buffer_x = -20.0f;
 float hid_buffer_y = 0.0f;
 std::mutex hid_mutex;
 std::atomic<bool> should_shoot(false);
@@ -198,7 +199,7 @@ int main() {
         
         int count = detect(ctx, rgb_img.data, CONF_THRES, NMS_THRES, dets, 100);
 
-        float min_dist = 100000;
+        float min_dist = 1e9f; // 修复：初始距离必须足够大，否则边缘目标会被忽略
         Detection* target = nullptr;
         float target_cx = 0, target_cy = 0;
         
@@ -255,8 +256,13 @@ int main() {
                 hid_buffer_y += move_y * MOUSE_SENSITIVITY;
             }
             
-            // 自动射击判断
-            if (min_dist < (SHOOT_THRES * SHOOT_THRES)) {
+            // 自动射击判断 (引入预测逻辑)
+            float pred_dx = raw_dx + (cd_x * SHOOT_PREDICTION);
+            float pred_dy = raw_dy + (cd_y * SHOOT_PREDICTION);
+            
+            // 使用矩形范围判断，包含当前位置 OR 预测位置
+            if ((std::abs(raw_dx) < SHOOT_THRES && std::abs(raw_dy) < SHOOT_THRES) || 
+                (std::abs(pred_dx) < SHOOT_THRES && std::abs(pred_dy) < SHOOT_THRES)) {
                 should_shoot = true;
             } else {
                 should_shoot = false;
