@@ -26,7 +26,7 @@ CONF_THRES = 0.45  # Lower threshold to catch weak detections
 USE_RGB_INPUT = True 
 CAMERA_INDEX = 20 # HDMI IN
 PORT = 5000
-TARGET_CLASS_ID = 1
+TARGET_CLASS_ID = 0
 
 # HID / 键鼠控制配置
 ENABLE_HID = True
