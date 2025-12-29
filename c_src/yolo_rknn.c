@@ -157,9 +157,7 @@ static unsigned char *load_model(const char *filename, int *model_size)
 
 void* init_model(const char* model_path) {
     int ret;
-    // Ensure stdout is unbuffered for debugging
-    setbuf(stdout, NULL);
-
+    
     RKNN_Context* ctx = (RKNN_Context*)malloc(sizeof(RKNN_Context));
     memset(ctx, 0, sizeof(RKNN_Context));
 
@@ -208,8 +206,6 @@ void* init_model(const char* model_path) {
         ctx->model_width = ctx->input_attrs[0].dims[3];
         ctx->model_height = ctx->input_attrs[0].dims[2];
     }
-
-    printf("[RKNN] Model Ready: %dx%d\n", ctx->model_width, ctx->model_height);
 
     ctx->is_init = true;
     return (void*)ctx;
@@ -275,7 +271,6 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
             int h, w, c;
             int fmt = ctx->output_attrs[i].fmt;
             
-            // Robust dimension detection
             if (fmt == RKNN_TENSOR_NHWC) {
                 h = ctx->output_attrs[i].dims[1];
                 w = ctx->output_attrs[i].dims[2];
@@ -287,40 +282,14 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
                 w = ctx->output_attrs[i].dims[3];
             }
             
-            // Calculate stride dynamically based on model width (640)
-            // Assuming square model
             int stride = ctx->model_width / w;
-
-            // Debug first frame only
-            static bool printed_info = false;
-            if (!printed_info) {
-                printf("[RKNN] Output %d: fmt=%d (0=NCHW, 1=NHWC), dims=[%d, %d, %d, %d] -> h=%d, w=%d, c=%d, stride=%d\n", 
-                       i, fmt, 
-                       ctx->output_attrs[i].dims[0], ctx->output_attrs[i].dims[1], 
-                       ctx->output_attrs[i].dims[2], ctx->output_attrs[i].dims[3],
-                       h, w, c, stride);
-            }
-
-            // Check if dimensions match expectation
-            if (c != 66) {
-                // Try to adapt if it's not 66
-                // If c is 80 or 40, maybe we parsed dims wrong?
-                if (h == 66) { // Swap H and C?
-                     int temp = h; h = c; c = temp;
-                     // If we swapped, we might need to change reading logic, but let's assume fmt was wrong
-                     // But let's just warn for now
-                     if (!printed_info) printf("[RKNN] Warning: c=%d, expected 66. Maybe dims are swapped?\n", c);
-                }
-            }
             int num_classes = c - 64;
             
             for (int y = 0; y < h; y++) {
                 for (int x = 0; x < w; x++) {
-                    // Find max class score first to filter
                     float max_score = 0;
                     int class_id = -1;
                     
-                    // Class scores start at offset 64
                     for (int cls = 0; cls < num_classes; cls++) {
                         float score;
                         if (fmt == RKNN_TENSOR_NHWC) {
@@ -329,7 +298,7 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
                             score = output_data[(64 + cls) * h * w + y * w + x];
                         }
                         
-                        score = sigmoid(score); // Apply sigmoid
+                        score = sigmoid(score);
                         if (score > max_score) {
                             max_score = score;
                             class_id = cls;
@@ -339,8 +308,7 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
                     if (max_score > conf_thres) {
                         if (det_count >= MAX_DETECTIONS) break;
                         
-                        // Decode DFL
-                        float dist[4]; // left, top, right, bottom
+                        float dist[4];
                         float dfl_buf[16];
                         
                         for(int d=0; d<4; d++) {
@@ -366,76 +334,6 @@ int detect(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_t
                         local_dets[det_count].y1 = y1;
                         local_dets[det_count].x2 = x2;
                         local_dets[det_count].y2 = y2;
-                        local_dets[det_count].score = max_score;
-                        local_dets[det_count].class_id = class_id;
-                        det_count++;
-
-                        if (!printed_info && det_count < 5) {
-                             printf("[RKNN] Det: cls=%d, score=%.2f, box=[%.1f, %.1f, %.1f, %.1f] grid=(%d,%d) stride=%d\n",
-                                    class_id, max_score, x1, y1, x2, y2, x, y, stride);
-                        }
-                    }
-                }
-            }
-            if (!printed_info && i == 2) printed_info = true;
-        }
-    } else {
-        // Fallback to single output logic (if user switches back)
-        // ... (Existing logic for single output)
-        float* output_data = (float*)outputs[0].buf;
-        int dim1 = ctx->output_attrs[0].dims[1];
-        int dim2 = ctx->output_attrs[0].dims[2];
-        int rows, cols;
-        bool transposed = false;
-        if (dim1 < dim2) { rows = dim1; cols = dim2; } 
-        else { rows = dim1; cols = dim2; transposed = true; }
-        int num_classes = (!transposed ? rows : cols) - 4;
-        
-        if (num_classes > 0) {
-             if (!transposed) {
-                for (int i = 0; i < cols; i++) {
-                    float max_score = 0;
-                    int class_id = -1;
-                    for (int c = 0; c < num_classes; c++) {
-                        float score = output_data[(4 + c) * cols + i];
-                        if (score > max_score) { max_score = score; class_id = c; }
-                    }
-                    if (max_score > conf_thres) {
-                        if (det_count >= MAX_DETECTIONS) break;
-                        float cx = output_data[0 * cols + i];
-                        float cy = output_data[1 * cols + i];
-                        float w = output_data[2 * cols + i];
-                        float h = output_data[3 * cols + i];
-                        local_dets[det_count].x1 = cx - w / 2;
-                        local_dets[det_count].y1 = cy - h / 2;
-                        local_dets[det_count].x2 = cx + w / 2;
-                        local_dets[det_count].y2 = cy + h / 2;
-                        local_dets[det_count].score = max_score;
-                        local_dets[det_count].class_id = class_id;
-                        det_count++;
-                    }
-                }
-            } else {
-                int stride = cols; 
-                int num_anchors = rows;
-                for (int i = 0; i < num_anchors; i++) {
-                    float* ptr = output_data + i * stride;
-                    float max_score = 0;
-                    int class_id = -1;
-                    for (int c = 0; c < num_classes; c++) {
-                        float score = ptr[4 + c];
-                        if (score > max_score) { max_score = score; class_id = c; }
-                    }
-                    if (max_score > conf_thres) {
-                        if (det_count >= MAX_DETECTIONS) break;
-                        float cx = ptr[0];
-                        float cy = ptr[1];
-                        float w = ptr[2];
-                        float h = ptr[3];
-                        local_dets[det_count].x1 = cx - w / 2;
-                        local_dets[det_count].y1 = cy - h / 2;
-                        local_dets[det_count].x2 = cx + w / 2;
-                        local_dets[det_count].y2 = cy + h / 2;
                         local_dets[det_count].score = max_score;
                         local_dets[det_count].class_id = class_id;
                         det_count++;
