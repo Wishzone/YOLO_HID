@@ -16,18 +16,18 @@
 #define MODEL_PATH "./Models/cf-11n-rk3588-int8.rknn"
 #define HID_DEVICE "/dev/hidg1"
 #define CAMERA_INDEX 20
-#define CONF_THRES 0.45f
+#define CONF_THRES 0.55f
 #define NMS_THRES 0.45f
 
 // 控制参数
 float PID_KP = 0.55f;
 float PID_KD = 0.3f;
 float MOUSE_SENSITIVITY = 0.4f;
-float HID_SMOOTH_FACTOR = 0.25f;
+float HID_SMOOTH_FACTOR = 0.3f;
 float AIM_DEADZONE = 0.0f; 
 float SHOOT_THRES = 15.0f;
 float AIM_HEIGHT_RATIO = 0.12f; // 瞄准高度偏移 (头部)
-float SHOOT_PREDICTION = 12.0f; // 射击预测帧数
+float SHOOT_PREDICTION = 9.0f; // 射击预测帧数
 
 // 全局状态
 std::atomic<bool> running(true);
@@ -79,6 +79,8 @@ void hid_worker() {
         int dx = 0, dy = 0;
         bool shoot = should_shoot.load();
         
+        uint8_t buttons = shoot ? 1 : 0;
+
         {
             std::lock_guard<std::mutex> lock(hid_mutex);
             
@@ -105,25 +107,19 @@ void hid_worker() {
             dx = (int)step_x;
             dy = (int)step_y;
             
-            // 从 buffer 中减去已移动的量
-            hid_buffer_x -= dx;
-            hid_buffer_y -= dy;
-        }
-        
-        uint8_t buttons = shoot ? 1 : 0;
-        
-        // 修复：必须在状态改变时发送报告，否则松开按键的信号发不出去
-        if (dx != 0 || dy != 0 || buttons != last_buttons) {
-            uint8_t report[] = {buttons, (uint8_t)dx, (uint8_t)dy, 0};
-            if (write(hid_fd, report, 4) < 0) {
-                // perror("HID Write");
+            // 只有写入成功才扣除，防止丢包 (解决 HID 写入过快导致的数据丢失问题)
+            if (dx != 0 || dy != 0 || buttons != last_buttons) {
+                uint8_t report[] = {buttons, (uint8_t)dx, (uint8_t)dy, 0};
+                if (write(hid_fd, report, 4) == 4) {
+                    hid_buffer_x -= dx;
+                    hid_buffer_y -= dy;
+                    last_buttons = buttons;
+                }
             }
         }
         
-        last_buttons = buttons;
-        
-        // 3ms 间隔 (约 333Hz)
-        std::this_thread::sleep_for(std::chrono::microseconds(3000));
+        // 1ms 间隔 (约 1000Hz)
+        std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
 }
 
@@ -169,6 +165,7 @@ int main() {
     if (!cap.isOpened()) {
         std::cout << "GStreamer failed, trying V4L2..." << std::endl;
         cap.open(CAMERA_INDEX, cv::CAP_V4L2);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1); // 关键：设置缓冲区为1，减少积压延迟
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('B', 'G', 'R', '3'));
         cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
