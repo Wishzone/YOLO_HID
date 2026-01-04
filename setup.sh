@@ -87,6 +87,14 @@ setup_latency() {
         # Disable auto-exposure/focus if they exist
         v4l2-ctl -d $VIDEO_DEV -c exposure_auto=1 2>/dev/null
         v4l2-ctl -d $VIDEO_DEV -c focus_auto=0 2>/dev/null
+        
+        # Load Custom EDID for 1080p 165Hz
+        EDID_FILE="$(dirname $0)/Models/1080p_165hz.edid"
+        if [ -f "$EDID_FILE" ]; then
+            echo "Loading Custom EDID from $EDID_FILE..."
+            v4l2-ctl -d $VIDEO_DEV --set-edid=file="$EDID_FILE",format=raw --fix-edid-checksums
+        fi
+        
         # Note: HDMI Input framerate is determined by source, skipping set-parm
     else
         echo "$VIDEO_DEV not found, skipping V4L2 tuning."
