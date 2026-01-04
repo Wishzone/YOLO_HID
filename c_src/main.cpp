@@ -164,7 +164,7 @@ int main() {
 
     // GStreamer 管道
     std::string pipe = "v4l2src device=/dev/video" + std::to_string(CAMERA_INDEX) + 
-                       " ! video/x-raw,width=1920,height=1080,framerate=165/1 ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1";
+                       " ! video/x-raw,width=1920,height=1080,framerate=240/1 ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1";
     cv::VideoCapture cap(pipe, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
         std::cout << "GStreamer failed, trying V4L2..." << std::endl;
@@ -172,7 +172,7 @@ int main() {
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('B', 'G', 'R', '3'));
         cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-        cap.set(cv::CAP_PROP_FPS, 165);
+        cap.set(cv::CAP_PROP_FPS, 180);
     }
     
     int w = cap.get(cv::CAP_PROP_FRAME_WIDTH);

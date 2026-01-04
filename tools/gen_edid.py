@@ -176,7 +176,113 @@ def generate_edid():
     # ...
     edid += bytearray(b'\xD1\xC0\x81\x80\x61\x40\x45\x40\x31\x40\x01\x01\x01\x01\x01\x01')
     
-    # Descriptor 1: 1920x1080 @ 165Hz (Preferred)
+    # Descriptor 1: 1920x1080 @ 240Hz (Preferred)
+    # Based on BenQ XL2546 timings (CVT-RB)
+    # Pixel Clock: 567.00 MHz
+    # H Total: 2080, V Total: 1136
+    timing_240 = {
+        "pixel_clock": 56700, # 567.00 MHz
+        "h_active": 1920,
+        "h_blank": 160,
+        "v_active": 1080,
+        "v_blank": 56, # 1136 - 1080
+        "h_sync_offset": 48,
+        "h_sync_width": 32,
+        "v_sync_offset": 3,
+        "v_sync_width": 5,
+        "h_size_mm": 527,
+        "v_size_mm": 296
+    }
+    edid += create_dtd(timing_240)
+    
+    # Descriptor 2: 1920x1080 @ 180Hz
+    # Pixel Clock: 419.33 MHz
+    # H Total: 2080, V Total: 1120
+    timing_180 = {
+        "pixel_clock": 41933,
+        "h_active": 1920,
+        "h_blank": 160,
+        "v_active": 1080,
+        "v_blank": 40,
+        "h_sync_offset": 48,
+        "h_sync_width": 32,
+        "v_sync_offset": 3,
+        "v_sync_width": 5,
+        "h_size_mm": 527,
+        "v_size_mm": 296
+    }
+    edid += create_dtd(timing_180)
+    
+    # Descriptor 3: Monitor Name
+    # 00 00 00 FC 00 ...
+    name = b"RK3588-Multi"
+    desc3 = bytearray(b'\x00\x00\x00\xFC\x00') + name + b'\x0A' + b'\x20' * (12 - len(name))
+    edid += desc3
+    
+    # Descriptor 4: Range Limits
+    # 00 00 00 FD 00 ...
+    # Min V: 48, Max V: 240, Min H: 30, Max H: 255 (kHz), Max Clock: 600 (MHz)
+    desc4 = bytearray(b'\x00\x00\x00\xFD\x00\x30\xF0\x1E\xFF\x3C\x00\x0A\x20\x20\x20\x20\x20\x20')
+    edid += desc4
+    
+    # Extension Flag (1) - We will add a CTA-861 Extension Block
+    edid += bytearray(b'\x01')
+    
+    # Checksum for Block 0
+    checksum = 0
+    for b in edid:
+        checksum += b
+    checksum = (256 - (checksum % 256)) % 256
+    edid += bytearray([checksum])
+    
+    # --- Block 1: CTA-861 Extension ---
+    cta = bytearray(128)
+    cta[0] = 0x02 # Tag: CTA-861
+    cta[1] = 0x03 # Revision 3
+    
+    # Offset to DTDs.
+    # We will have 2 DTDs in Block 1: 165Hz and 60Hz
+    
+    idx = 4 # Start of Data Blocks
+    
+    # 1. Video Data Block (SVD)
+    # Tag: 2 (010), Length: 1 -> 0x41
+    # SVD: 1080p60 (VIC 16) | Native (0x90)
+    cta[idx] = 0x41
+    cta[idx+1] = 0x90 # VIC 16 (1080p60) Native
+    idx += 2
+    
+    # 2. HDMI VSDB (HDMI 1.4)
+    # Tag: 3 (011), Length: 8
+    # Header: (3 << 5) | 8 = 0x68
+    cta[idx] = 0x68
+    cta[idx+1] = 0x03
+    cta[idx+2] = 0x0C
+    cta[idx+3] = 0x00
+    cta[idx+4] = 0x10 # PA 1.0
+    cta[idx+5] = 0x00 # PA 0.0
+    cta[idx+6] = 0x00 # Flags
+    cta[idx+7] = 0x44 # Max TMDS 340MHz
+    cta[idx+8] = 0x00 # Video Latency
+    cta[idx+9] = 0x00 # Audio Latency
+    idx += 10
+    
+    # 3. HDMI Forum VSDB (HDMI 2.0)
+    # Tag: 3 (011), Length: 6
+    # Header: (3 << 5) | 6 = 0x66
+    cta[idx] = 0x66
+    cta[idx+1] = 0xD8
+    cta[idx+2] = 0x5D
+    cta[idx+3] = 0xC4
+    cta[idx+4] = 0x01 # Version
+    cta[idx+5] = 0x78 # Max TMDS 600MHz
+    cta[idx+6] = 0x80 # SCDC Present
+    idx += 7
+    
+    # DTD Start Offset
+    cta[2] = idx
+    
+    # DTD 1: 1920x1080 @ 165Hz
     timing_165 = {
         "pixel_clock": 38098,
         "h_active": 1920,
@@ -190,16 +296,18 @@ def generate_edid():
         "h_size_mm": 527,
         "v_size_mm": 296
     }
-    edid += create_dtd(timing_165)
+    dtd_165 = create_dtd(timing_165)
+    for i in range(18):
+        cta[idx+i] = dtd_165[i]
+    idx += 18
     
-    # Descriptor 2: 1920x1080 @ 60Hz
-    # Pixel Clock: 148.5 MHz = 14850
+    # DTD 2: 1920x1080 @ 60Hz
     timing_60 = {
         "pixel_clock": 14850,
         "h_active": 1920,
-        "h_blank": 280, # 2200 - 1920
+        "h_blank": 280,
         "v_active": 1080,
-        "v_blank": 45, # 1125 - 1080
+        "v_blank": 45,
         "h_sync_offset": 88,
         "h_sync_width": 44,
         "v_sync_offset": 4,
@@ -207,34 +315,26 @@ def generate_edid():
         "h_size_mm": 527,
         "v_size_mm": 296
     }
-    edid += create_dtd(timing_60)
+    dtd_60 = create_dtd(timing_60)
+    for i in range(18):
+        cta[idx+i] = dtd_60[i]
+    idx += 18
     
-    # Descriptor 3: Monitor Name
-    # 00 00 00 FC 00 ...
-    name = b"RK3588-165Hz"
-    desc3 = bytearray(b'\x00\x00\x00\xFC\x00') + name + b'\x0A' + b'\x20' * (12 - len(name))
-    edid += desc3
+    # Padding with 0s (already 0)
     
-    # Descriptor 4: Range Limits
-    # 00 00 00 FD 00 ...
-    # Min V: 48, Max V: 165, Min H: 30, Max H: 200, Max Clock: 400
-    desc4 = bytearray(b'\x00\x00\x00\xFD\x00\x30\xA5\x1E\xC8\x28\x00\x0A\x20\x20\x20\x20\x20\x20')
-    edid += desc4
-    
-    # Extension Flag (0)
-    edid += bytearray(b'\x00')
-    
-    # Checksum
+    # Checksum for Block 1
     checksum = 0
-    for b in edid:
+    for b in cta:
         checksum += b
     checksum = (256 - (checksum % 256)) % 256
-    edid += bytearray([checksum])
+    cta[127] = checksum
+    
+    edid += cta
     
     return edid
 
 if __name__ == "__main__":
     edid_data = generate_edid()
-    with open("1080p_165hz.edid", "wb") as f:
+    with open("1080p_multi_hz.edid", "wb") as f:
         f.write(edid_data)
-    print("Generated 1080p_165hz.edid")
+    print("Generated 1080p_multi_hz.edid")
