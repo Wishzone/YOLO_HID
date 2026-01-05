@@ -32,27 +32,13 @@ git clone <repository_url>
 cd YOLO11n
 ```
 
-### 2. 安装 Python 依赖
-建议使用 Conda 环境管理依赖：
-```bash
-conda create -n rknn python=3.9
-conda activate rknn
-
-# 安装基础库
-pip install flask opencv-python numpy
-
-# 安装 RKNN Toolkit Lite2
-# 请前往 Rockchip 官方仓库下载适配你 Python 版本的 .whl 文件
-# 例如: pip install rknn_toolkit_lite2-2.0.0b0-cp39-cp39-linux_aarch64.whl
-```
-
-### 3. 编译 C 加速库 (必须)
-本项目使用 C 语言处理 NPU 输出以提升性能，必须先编译共享库：
+### 2. 编译 C 代码
+本项目使用 C 语言处理 NPU 输出以提升性能：
 ```bash
 cd c_src
 make
 cd ..
-# 编译成功后，应在 c_src 目录下看到 librknn_yolo.so
+# 编译成功后，应在 src 目录下看到 librknn_yolo.so
 ```
 
 ## 🚀 运行指南
@@ -70,12 +56,6 @@ sudo python3 yolo_web_hid.py
 ```
 *   程序默认监听 HDMI IN (Camera Index 20)，如需更改请编辑 `yolo_web_hid.py` 中的 `CAMERA_INDEX`。
 *   默认加载模型: `./Models/cf-11n-rk3588-int8.rknn`。
-
-### 3. Web 控制台
-程序启动后，在浏览器访问开发板 IP：
-`http://<开发板IP>:5000`
-*   查看实时推理画面。
-*   (未来功能) 动态调整灵敏度、阈值等参数。
 
 ## 📂 文件结构说明
 
