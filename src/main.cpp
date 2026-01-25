@@ -27,11 +27,11 @@
 #define MODEL_PATH "./Models/cf-11n-rk3588-int8.rknn"
 #define HID_DEVICE "/dev/hidg1"
 #define CAMERA_INDEX 20
-#define CONF_THRES 0.2f
+#define CONF_THRES 0.55f
 #define NMS_THRES 0.45f
 #define HTTP_PORT 8080
 #define MJPEG_QUALITY 80 
-#define WEB_MAX_FPS 15
+#define WEB_MAX_FPS 30
 
 // Control Parameters
 const float PID_KP = 0.55f;
@@ -40,9 +40,11 @@ const float MOUSE_SENSITIVITY = 0.4f;
 const float HID_SMOOTH_FACTOR = 0.3f;
 const float AIM_DEADZONE = 0.0f; 
 const float AIM_HEIGHT_RATIO = 0.12f;
+const float AUTO_FIRE_RADIUS = 15.0f; 
 
 // --- Global State ---
 std::atomic<bool> running(true);
+std::atomic<bool> fire_request(false);
 std::atomic<int> active_connections(0);
 int hid_fd = -1;
 
@@ -110,6 +112,7 @@ void hid_worker() {
     struct pollfd pfd;
     pfd.fd = hid_fd;
     pfd.events = POLLOUT;
+    bool last_fire_state = false;
     
     while (running) {
         if (hid_fd < 0) {
@@ -119,7 +122,7 @@ void hid_worker() {
 
         {
             std::unique_lock<std::mutex> lock(hid_mutex);
-            if (std::abs(hid_buffer_x) < 0.5f && std::abs(hid_buffer_y) < 0.5f) {
+            if (std::abs(hid_buffer_x) < 0.5f && std::abs(hid_buffer_y) < 0.5f && fire_request == last_fire_state) {
                 hid_cv.wait(lock);
             }
         }
@@ -128,6 +131,8 @@ void hid_worker() {
         if (poll(&pfd, 1, 5) <= 0) continue; 
 
         int dx = 0, dy = 0;
+        bool current_fire = fire_request;
+
         {
             std::lock_guard<std::mutex> lock(hid_mutex);
             float step_x = hid_buffer_x * HID_SMOOTH_FACTOR;
@@ -148,12 +153,13 @@ void hid_worker() {
             dx = (int)step_x;
             dy = (int)step_y;
             
-            if (dx != 0 || dy != 0) {
-                uint8_t report[] = {0, (uint8_t)dx, (uint8_t)dy, 0}; 
+            if (dx != 0 || dy != 0 || current_fire != last_fire_state) {
+                uint8_t report[] = {(uint8_t)(current_fire ? 0x01 : 0), (uint8_t)dx, (uint8_t)dy, 0}; 
                 if (write(hid_fd, report, 4) == 4) {
                     hid_buffer_x -= dx;
                     hid_buffer_y -= dy;
                 }
+                last_fire_state = current_fire;
             }
         }
     }
@@ -445,6 +451,12 @@ int main() {
             float mx = (PID_KP * raw_dx) + (PID_KD * cd_x);
             float my = (PID_KP * raw_dy) + (PID_KD * cd_y);
             
+            bool should_fire = (min_dist < AUTO_FIRE_RADIUS * AUTO_FIRE_RADIUS);
+            if (fire_request != should_fire) {
+                fire_request = should_fire;
+                hid_cv.notify_one();
+            }
+
             {
                 std::lock_guard<std::mutex> lock(hid_mutex);
                 hid_buffer_x += mx * MOUSE_SENSITIVITY;
@@ -453,6 +465,10 @@ int main() {
             hid_cv.notify_one();
         } else {
             pid_state.tracking_frames = 0;
+            if (fire_request) {
+                 fire_request = false;
+                 hid_cv.notify_one();
+            }
             std::lock_guard<std::mutex> lock(hid_mutex);
             hid_buffer_x = 0; hid_buffer_y = 0;
         }

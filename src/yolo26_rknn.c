@@ -47,21 +47,22 @@ static float iou(Detection26* a, Detection26* b) {
     return inter / (area_a + area_b - inter);
 }
 
+static int compare_dets(const void* a, const void* b) {
+    Detection26* det_a = (Detection26*)a;
+    Detection26* det_b = (Detection26*)b;
+    // Sort descending
+    if (det_a->score > det_b->score) return -1;
+    if (det_a->score < det_b->score) return 1;
+    return 0;
+}
+
 static void nms_process(Detection26* dets, int* count, float threshold) {
     int keep[MAX_DETECTIONS];
     int keep_count = 0;
     int suppressed[MAX_DETECTIONS] = {0};
 
-    // Sort by score descending
-    for (int i = 0; i < *count - 1; i++) {
-        for (int j = 0; j < *count - i - 1; j++) {
-            if (dets[j].score < dets[j + 1].score) {
-                Detection26 temp = dets[j];
-                dets[j] = dets[j + 1];
-                dets[j + 1] = temp;
-            }
-        }
-    }
+    // Sort by score descending (Optimized with qsort)
+    qsort(dets, *count, sizeof(Detection26), compare_dets);
 
     for (int i = 0; i < *count; i++) {
         if (suppressed[i]) continue;
