@@ -25,6 +25,10 @@
 #include "yolo26_rknn.h"
 #include "v4l2_driver.h"
 
+// Forward Declarations
+void set_affinity_little();
+void set_affinity_big();
+
 // --- 配置 ---
 // YOLO26 修改后的模型路径
 #define MODEL_PATH "./Models/cf-26n-rk3588-int8_100.rknn"
@@ -35,7 +39,6 @@
 #define NMS_THRES 0.45f
 #define HTTP_PORT 8080
 #define MJPEG_QUALITY 80 
-#define WEB_MAX_FPS 30
 
 // 控制参数
 // 针对低延迟/即时响应进行了调优
@@ -69,6 +72,7 @@ struct WebData {
     std::vector<Detection26> dets;
     float r; int dw, dh;
     bool valid = false;
+    uint64_t frame_id = 0;
 } web_data_buffer;
 std::mutex web_mutex;
 
@@ -78,6 +82,92 @@ struct {
     float last_error_y = 0;
     int tracking_frames = 0;
 } pid_state;
+
+// --- Web 卸载处理逻辑 ---
+std::atomic<int> web_transfer_buf_idx{-1};
+std::mutex web_transfer_mutex;
+std::vector<Detection26> web_transfer_dets;
+// 这些参数用于 Web 线程做 RGA 处理
+float web_transfer_r; 
+int web_transfer_dw, web_transfer_dh;
+int web_transfer_src_dma;
+int web_transfer_src_w, web_transfer_src_h;
+int web_transfer_length;
+void* web_transfer_data = nullptr;
+
+// 独立的 Web 帧处理线程（Consumer）
+// 它从主线程接收 V4L2 Buffer 索引，执行 RGA Copy，更新 WebData，然后归还 Buffer。
+void web_processor_func(v4l2_context_t* v4l2_ctx) {
+    set_affinity_little(); // 在小核上运行，不影响推理
+    
+    while(running) {
+        // 1. 获取 Buffer
+        // 这是一个自旋等待还是休眠？由于我们希望“尽力而为”，休眠是好的。
+        int idx = web_transfer_buf_idx.exchange(-1);
+        if (idx == -1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        
+        // 2. 拿到数据了，开始处理
+        // 从全局 transfer 变量读取参数 (不需要太严格的锁，因为主线程只有在 web_transfer_buf_idx == -1 时才会写这些变量)
+        // 但为了安全，我们可以加个轻量锁，或者依靠原子变量的 happens-before
+        // 实际上，只要主线程遵循 protocol: "Write Params -> Set Atomic IDX"，Web 线程 "Read Atomic IDX -> Read Params"，内存顺序应该就是安全的。
+        
+        std::vector<Detection26> local_dets;
+        {
+            std::lock_guard<std::mutex> lock(web_transfer_mutex);
+            local_dets = web_transfer_dets;
+        }
+        
+        // 3. RGA Copy / Decode
+        bool processed = false;
+        
+        // 准备目标 Web 缓冲区
+        {
+             // 只有在要写入时才锁定 Web 缓冲区
+             // 我们先在本地做 RGA（如果有双缓冲更好，但这里我们可以直接写入 WebData 的 Mat，因为从 WebData 读取是瞬间的 memcpy 或 encode）
+             // 为了减少 WebMutex 持有时间，我们可以暂时只申请内存
+        }
+
+        // 注意：我们必须直接往 WebData 写，或者写到一个本地 Mat 然后 swap。
+        // 为了简单，我们直接尝试 lock web_mutex。如果 Web Server 正在发送（持有锁），我们稍等一下也没事。
+        // 但为了极致性能，我们可以在这里使用双缓冲，但目前已经是“后台线程”了，稍微阻塞一下不影响主线程 FPS。
+        
+        std::unique_lock<std::mutex> lock(web_mutex);
+        
+        if (web_data_buffer.img.empty() || 
+            web_data_buffer.img.cols != web_transfer_src_w || 
+            web_data_buffer.img.rows != web_transfer_src_h) {
+             web_data_buffer.img.create(web_transfer_src_h, web_transfer_src_w, CV_8UC3);
+        }
+
+        if (v4l2_ctx->format == V4L2_PIX_FMT_BGR24) {
+             rga_buffer_t src_rga = wrapbuffer_fd(web_transfer_src_dma, web_transfer_src_w, web_transfer_src_h, RK_FORMAT_BGR_888);
+             rga_buffer_t dst_rga = wrapbuffer_virtualaddr(web_data_buffer.img.data, web_transfer_src_w, web_transfer_src_h, RK_FORMAT_BGR_888);
+             imcopy(src_rga, dst_rga);
+        } else {
+             // MJPEG Fallback
+             cv::Mat raw_mat(1, web_transfer_length, CV_8UC1, web_transfer_data);
+             cv::Mat decoded;
+             cv::imdecode(raw_mat, cv::IMREAD_COLOR, &decoded);
+             if(!decoded.empty()) decoded.copyTo(web_data_buffer.img);
+        }
+        
+        // 4. 更新检测结果
+        web_data_buffer.dets = local_dets;
+        web_data_buffer.r = web_transfer_r;
+        web_data_buffer.dw = web_transfer_dw;
+        web_data_buffer.dh = web_transfer_dh;
+        web_data_buffer.valid = true;
+        web_data_buffer.frame_id++;
+        
+        lock.unlock(); // Done updating web data
+        
+        // 5. 归还 Buffer 给 V4L2 驱动 (关键！)
+        v4l2_manual_qbuf(v4l2_ctx, idx);
+    }
+}
 
 // --- 系统工具 ---
 
@@ -301,49 +391,62 @@ void http_server_func() {
         if (poll(&pfd, 1, 1000) > 0) {
             int new_socket = accept(server_fd, nullptr, nullptr);
             if (new_socket >= 0) {
+                if (active_connections >= 5) {
+                    close(new_socket);
+                    continue;
+                }
                 active_connections++;
                 std::thread([new_socket]() {
+                    struct timeval tv = {3, 0};
+                    setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                    setsockopt(new_socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
                     const char* header = "HTTP/1.1 200 OK\r\n"
                                        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
                     send(new_socket, header, strlen(header), 0);
                     
-                    auto last_frame_time = std::chrono::steady_clock::now();
+                    uint64_t last_frame_id = 0;
                     std::vector<uchar> buf;
                     std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, MJPEG_QUALITY};
                     
                     while (running && active_connections > 0) {
-                        auto now = std::chrono::steady_clock::now();
-                        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time).count() < 1000/WEB_MAX_FPS) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                            continue;
-                        }
-
                         cv::Mat frame;
-                        std::vector<Detection26> dets;
+                        std::vector<Detection26> local_dets;
+                        float local_r; int local_dw, local_dh;
+                        bool has_new_data = false;
                         
                         {
-                            std::unique_lock<std::mutex> lock(web_mutex);
-                            if (!web_data_buffer.valid || web_data_buffer.img.empty()) {
-                                lock.unlock();
-                                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                                continue;
+                            std::unique_lock<std::mutex> lock(web_mutex, std::try_to_lock); // 使用 try_lock 避免阻塞推理线程
+                            if (lock.owns_lock() && web_data_buffer.valid && !web_data_buffer.img.empty()) {
+                                if (web_data_buffer.frame_id > last_frame_id) {
+                                    frame = web_data_buffer.img.clone();
+                                    local_dets = web_data_buffer.dets;
+                                    local_r = web_data_buffer.r;
+                                    local_dw = web_data_buffer.dw;
+                                    local_dh = web_data_buffer.dh;
+                                    last_frame_id = web_data_buffer.frame_id;
+                                    has_new_data = true;
+                                }
                             }
-                            frame = web_data_buffer.img.clone();
-                            dets = web_data_buffer.dets;
+                        }
+
+                        if (!has_new_data) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2)); // 短暂休眠以避免空转
+                            continue;
+                        }
                             
-                            // Visualization
-                            for (const auto& det : dets) {
-                                int x1 = (det.x1 - web_data_buffer.dw) / web_data_buffer.r;
-                                int y1 = (det.y1 - web_data_buffer.dh) / web_data_buffer.r;
-                                int x2 = (det.x2 - web_data_buffer.dw) / web_data_buffer.r;
-                                int y2 = (det.y2 - web_data_buffer.dh) / web_data_buffer.r;
-                                
-                                cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
-                                std::string label = std::to_string(det.class_id) + " " + 
-                                                  std::to_string((int)(det.score * 100)) + "%";
-                                cv::putText(frame, label, cv::Point(x1, y1 - 5), 
-                                          cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-                            }
+                        // Visualization (Outside lock)
+                        for (const auto& det : local_dets) {
+                            int x1 = (det.x1 - local_dw) / local_r;
+                            int y1 = (det.y1 - local_dh) / local_r;
+                            int x2 = (det.x2 - local_dw) / local_r;
+                            int y2 = (det.y2 - local_dh) / local_r;
+                            
+                            cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
+                            std::string label = std::to_string(det.class_id) + " " + 
+                                                std::to_string((int)(det.score * 100)) + "%";
+                            cv::putText(frame, label, cv::Point(x1, y1 - 5), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
                         }
 
                         cv::imencode(".jpg", frame, buf, params);
@@ -356,8 +459,6 @@ void http_server_func() {
                             send(new_socket, "\r\n", 2, MSG_NOSIGNAL) < 0) {
                             break;
                         }
-                        
-                        last_frame_time = now;
                     }
                     close(new_socket);
                     active_connections--;
@@ -379,6 +480,8 @@ int main(int argc, char** argv) {
     }
 
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
+    cv::setNumThreads(1); // [关键修复] 禁止 OpenCV 创建额外的工作线程（防止它们跑去大核）
+    signal(SIGPIPE, SIG_IGN); // 忽略 SIGPIPE，防止 Socket 关闭导致程序退出
     set_realtime_priority();
     lock_memory();
     set_affinity_big();
@@ -401,6 +504,16 @@ int main(int argc, char** argv) {
     // 线程
     std::thread t_hid(hid_thread_func);
     std::thread t_http(http_server_func);
+    std::thread t_web_proc(web_processor_func, &v4l2_ctx); // 启动 Web 帧处理线程
+
+    std::thread cleaner_thread([](){ 
+        set_affinity_little();
+        while(running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            scrub_sync_files();
+        }
+    });
+    cleaner_thread.detach();
 
     // 缓冲区
     const int model_width = 640;
@@ -413,8 +526,6 @@ int main(int argc, char** argv) {
     
     Detection26 results[MAX_DETECTIONS];
     
-    std::cout << "[System] Loop Start" << std::endl;
-    
     struct v4l2_buffer buf;
     struct v4l2_plane planes[8]; // For MPLANE support
     memset(&buf, 0, sizeof(buf));
@@ -425,6 +536,15 @@ int main(int argc, char** argv) {
     cap_thread.detach();
 
     auto t_last_print = std::chrono::steady_clock::now();
+
+    // 预先计算 Letterbox 参数
+    int src_w = v4l2_ctx.width;
+    int src_h = v4l2_ctx.height;
+    float r_ratio = std::min((float)model_width / src_w, (float)model_height / src_h);
+    int nw = src_w * r_ratio;
+    int nh = src_h * r_ratio;
+    int dw = (model_width - nw) / 2;
+    int dh = (model_height - nh) / 2;
 
     while (running) {
         auto t_start = std::chrono::steady_clock::now();
@@ -447,35 +567,13 @@ int main(int argc, char** argv) {
         buf.index = buf_idx;
         buf.type = v4l2_ctx.type;
         buf.memory = V4L2_MEMORY_MMAP;
-        // 注意：这里我们没有由 DQBUF 填充的完整 buf 结构，但我们只需要索引，其余的我们可以从 v4l2_ctx 状态得知或是静态的
         
         // 为了零拷贝优化，我们需要 dma_fd
         int src_dma_fd = v4l2_ctx.buffers[buf_idx].dma_fd;
         void* frame_data = v4l2_ctx.buffers[buf_idx].start;
         int length = v4l2_ctx.buffers[buf_idx].length;
-        int src_w = v4l2_ctx.width;
-        int src_h = v4l2_ctx.height;
         
-        auto t_cap = std::chrono::steady_clock::now();
-
         // 2. 使用 RGA 进行预处理（硬件缩放）
-        
-        // 计算 Letterbox 参数
-        float r = std::min((float)model_width / src_w, (float)model_height / src_h);
-        int nw = src_w * r;
-        int nh = src_h * r;
-        int dw = (model_width - nw) / 2;
-        int dh = (model_height - nh) / 2;
-
-        // 重置背景为灰色 (114)
-        // 这在 CPU 上处理 640x640 足够快（约 0.3ms），或者使用 RGA 填充
-        // memset(rknn_input_mem.data(), 114, rknn_input_mem.size());
-        
-        // RGA 缩放与转换
-        // 源：V4L2 DMA FD（对于 V4L2_PIX_FMT_BGR24 通常是 BGR888）
-        // 目标：虚拟地址（RKNN 使用 RGB888）
-        // 我们将目标映射到 ROI（Letterbox 中心）
-        
         rga_buffer_t src_rga;
         rga_buffer_t dst_rga;
         memset(&src_rga, 0, sizeof(src_rga));
@@ -486,34 +584,10 @@ int main(int argc, char** argv) {
         // 指针偏移到 (dw, dh)
         unsigned char* dst_ptr = rknn_input_mem.data() + (dh * model_width + dw) * 3;
         dst_rga = wrapbuffer_virtualaddr(dst_ptr, nw, nh, RK_FORMAT_RGB_888);
-        
-        // 修复 stride 问题：wrapbuffer_virtualaddr 隐式设置 stride = width
-        // 但我们的子缓冲区是更大的 model_width 行跨度的一部分。
-        // 我们必须手动将 stride 设置为 model_width
         dst_rga.wstride = model_width; 
         
-        // 执行 RGA
         imresize(src_rga, dst_rga);
         
-        // Web 显示处理（延迟拷贝）
-        if (active_connections > 0) {
-             // Web 需要 bgr_frame
-             // 仅当有客户端时才克隆
-             if (v4l2_ctx.format == V4L2_PIX_FMT_BGR24) {
-                 cv::Mat bgr_raw(src_h, src_w, CV_8UC3, frame_data);
-                 bgr_frame = bgr_raw.clone(); 
-             } else {
-                 // MJPEG 后备
-                 cv::Mat raw_mat(1, length, CV_8UC1, frame_data);
-                 cv::imdecode(raw_mat, cv::IMREAD_COLOR, &bgr_frame);
-             }
-        }
-        
-        // 立即释放缓冲区（RGA 推理路径的零拷贝已完成，如果 Web使用了克隆，我们也安全）
-        v4l2_manual_qbuf(&v4l2_ctx, buf_idx); // <--- 归还我们处理过的缓冲区
-
-        auto t_pre = std::chrono::steady_clock::now();
-
         // 3. 推理
         int count = detect_yolo26(
             rknn_ctx, 
@@ -524,8 +598,6 @@ int main(int argc, char** argv) {
             MAX_DETECTIONS
         );
         
-        auto t_infer = std::chrono::steady_clock::now();
-
         // 4. 逻辑与更新状态
         float cx = model_width / 2.0f;
         float cy = model_height / 2.0f;
@@ -534,6 +606,7 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < count; i++) {
             if (results[i].class_id != target_class_id) continue;
+
 
             // 寻找离中心最近的目标
             float bx = (results[i].x1 + results[i].x2) / 2.0f;
@@ -600,22 +673,41 @@ int main(int argc, char** argv) {
         }
 
 
-        // 5. 更新 Web
+        // 5. 将 Buffer 转让给 Web 线程 (如果它空闲)
+        // 只有当有活跃连接时才尝试转让，否则直接归还
+        bool buffer_offloaded = false;
+        
         if (active_connections > 0) {
-            std::lock_guard<std::mutex> lock(web_mutex);
-            web_data_buffer.img = bgr_frame.clone(); // 原始帧
-            
-            // 将检测结果映射回原始帧坐标以进行显示
-            web_data_buffer.dets.clear();
-            for (int i = 0; i < count; i++) {
-                // 坐标在模型空间（640x640 带填充）
-                // 需要按原样存储，Web 线程将使用 'dw', 'dh', 'r' 进行可视化
-                web_data_buffer.dets.push_back(results[i]);
+            int expected = -1;
+            // 尝试原子地将 web_transfer_buf_idx 从 -1 改为 buf_idx
+            // 如果它不是 -1 (说明 Web 线程还在忙上一帧)，则 compare_exchange 失败，我们不做 offload。
+            // 在修改 idx 之前，先准备好参数 (这在单生产者-单消费者下是安全的，因为消费者只在 idx != -1 时读)
+            if (std::atomic_load(&web_transfer_buf_idx) == -1) {
+                // 填充参数
+                {
+                    std::lock_guard<std::mutex> lock(web_transfer_mutex);
+                    web_transfer_dets.clear();
+                    for(int i=0; i<count; i++) web_transfer_dets.push_back(results[i]);
+                }
+                web_transfer_r = r_ratio;
+                web_transfer_dw = dw;
+                web_transfer_dh = dh;
+                web_transfer_src_dma = src_dma_fd;
+                web_transfer_src_w = src_w;
+                web_transfer_src_h = src_h;
+                web_transfer_length = length;
+                web_transfer_data = frame_data; // 只要 buffer 没归还，这个指针就是有效的
+
+                // 提交任务
+                if (web_transfer_buf_idx.compare_exchange_strong(expected, buf_idx)) {
+                    buffer_offloaded = true;
+                }
             }
-            web_data_buffer.r = r;
-            web_data_buffer.dw = dw;
-            web_data_buffer.dh = dh;
-            web_data_buffer.valid = true;
+        }
+        
+        // 如果没有成功转让给 Web 线程 (因为 Web 忙 或者 无连接)，必须立即归还 Buffer
+        if (!buffer_offloaded) {
+            v4l2_manual_qbuf(&v4l2_ctx, buf_idx);
         }
 
         auto t_end = std::chrono::steady_clock::now();
@@ -633,6 +725,7 @@ int main(int argc, char** argv) {
     hid_cv.notify_all();
     t_hid.join();
     t_http.join();
+    if(t_web_proc.joinable()) t_web_proc.join();
     
     release_yolo26_model(rknn_ctx);
     v4l2_close(&v4l2_ctx);

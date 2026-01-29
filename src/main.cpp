@@ -23,6 +23,10 @@
 #include "yolo_rknn.h"
 #include "v4l2_driver.h"
 
+// Forward Declarations
+void set_affinity_little();
+void set_affinity_big();
+
 // --- Configuration ---
 #define MODEL_PATH "./Models/cf-11n-rk3588-int8.rknn"
 #define HID_DEVICE "/dev/hidg1"
@@ -31,7 +35,6 @@
 #define NMS_THRES 0.45f
 #define HTTP_PORT 8080
 #define MJPEG_QUALITY 80 
-#define WEB_MAX_FPS 30
 
 // Control Parameters
 const float PID_KP = 0.55f;
@@ -60,6 +63,7 @@ struct WebData {
     std::vector<Detection> dets;
     float r; int dw, dh;
     bool valid = false;
+    uint64_t frame_id = 0;
 } web_data_buffer;
 std::mutex web_mutex;
 
@@ -69,6 +73,67 @@ struct {
     float last_error_y = 0;
     int tracking_frames = 0;
 } pid_state;
+
+// --- Web Offload Logic ---
+std::atomic<int> web_transfer_buf_idx{-1};
+std::mutex web_transfer_mutex;
+std::vector<Detection> web_transfer_dets;
+float web_transfer_r; 
+int web_transfer_dw, web_transfer_dh;
+int web_transfer_src_dma;
+int web_transfer_src_w, web_transfer_src_h;
+int web_transfer_length;
+void* web_transfer_data = nullptr;
+
+void web_processor_func(v4l2_context_t* v4l2_ctx) {
+    set_affinity_little(); 
+    
+    while(running) {
+        // Wait for buffer from main loop
+        int idx = web_transfer_buf_idx.exchange(-1);
+        if (idx == -1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        
+        std::vector<Detection> local_dets;
+        {
+            std::lock_guard<std::mutex> lock(web_transfer_mutex);
+            local_dets = web_transfer_dets;
+        }
+        
+        std::unique_lock<std::mutex> lock(web_mutex);
+        
+        if (web_data_buffer.img.empty() || 
+            web_data_buffer.img.cols != web_transfer_src_w || 
+            web_data_buffer.img.rows != web_transfer_src_h) {
+             web_data_buffer.img.create(web_transfer_src_h, web_transfer_src_w, CV_8UC3);
+        }
+
+        if (v4l2_ctx->format == V4L2_PIX_FMT_BGR24) {
+             rga_buffer_t src_rga = wrapbuffer_fd(web_transfer_src_dma, web_transfer_src_w, web_transfer_src_h, RK_FORMAT_BGR_888);
+             rga_buffer_t dst_rga = wrapbuffer_virtualaddr(web_data_buffer.img.data, web_transfer_src_w, web_transfer_src_h, RK_FORMAT_BGR_888);
+             imcopy(src_rga, dst_rga);
+        } else {
+             cv::Mat raw_mat(1, web_transfer_length, CV_8UC1, web_transfer_data);
+             cv::Mat decoded;
+             cv::imdecode(raw_mat, cv::IMREAD_COLOR, &decoded);
+             if(!decoded.empty()) decoded.copyTo(web_data_buffer.img);
+        }
+        
+        web_data_buffer.dets = local_dets;
+        web_data_buffer.r = web_transfer_r;
+        web_data_buffer.dw = web_transfer_dw;
+        web_data_buffer.dh = web_transfer_dh;
+        web_data_buffer.valid = true;
+        web_data_buffer.frame_id++;
+        
+        lock.unlock(); 
+        
+        // Return buffer to V4L2
+        v4l2_manual_qbuf(v4l2_ctx, idx);
+    }
+}
 
 // --- System Utilities ---
 void set_realtime_priority() {
@@ -266,6 +331,7 @@ void handle_client(int client_socket) {
         cv::Mat local_frame;
         std::vector<Detection> local_dets;
         float r; int dw, dh;
+        uint64_t last_frame_id = 0;
         
         while (running) {
             char c;
@@ -275,10 +341,13 @@ void handle_client(int client_socket) {
             {
                 std::unique_lock<std::mutex> lock(web_mutex, std::try_to_lock);
                 if (lock.owns_lock() && web_data_buffer.valid) {
-                    web_data_buffer.img.copyTo(local_frame);
-                    local_dets = web_data_buffer.dets;
-                    r = web_data_buffer.r; dw = web_data_buffer.dw; dh = web_data_buffer.dh;
-                    has_new = true;
+                    if (web_data_buffer.frame_id > last_frame_id) {
+                        web_data_buffer.img.copyTo(local_frame);
+                        local_dets = web_data_buffer.dets;
+                        r = web_data_buffer.r; dw = web_data_buffer.dw; dh = web_data_buffer.dh;
+                        last_frame_id = web_data_buffer.frame_id;
+                        has_new = true;
+                    }
                 }
             }
 
@@ -347,6 +416,7 @@ int main() {
     std::cout << "[System] Manual V4L2 Driver Started" << std::endl;
     
     std::thread cap_thread(capture_worker, &camera_ctx);
+    std::thread web_proc_thread(web_processor_func, &camera_ctx); // Launch processor
     
     cv::Mat letterbox_img(640, 640, CV_8UC3);
     cv::Mat rgb_img(640, 640, CV_8UC3);
@@ -354,11 +424,15 @@ int main() {
     
     Detection dets[50];
     auto last_print_time = std::chrono::high_resolution_clock::now();
-    double acc_total = 0, acc_pre = 0, acc_infer = 0;
     int frame_count = 0;
     
     const float cx = 1920 / 2.0f;
     const float cy = 1080 / 2.0f;
+
+    // 预计算参数
+    float r = std::min(640.0f/1080.0f, 640.0f/1920.0f);
+    int nw = round(1920*r), nh = round(1080*r);
+    int dw = (640-nw)/2, dh = (640-nh)/2;
 
     while (running) {
         auto t_start = std::chrono::high_resolution_clock::now();
@@ -379,12 +453,7 @@ int main() {
         // Zero-Copy RGA Preprocess
         int dma_fd = camera_ctx.buffers[current_idx].dma_fd;
         void* raw_data = camera_ctx.buffers[current_idx].start;
-        float r; int dw, dh;
         
-        r = std::min(640.0f/1080.0f, 640.0f/1920.0f);
-        int nw = round(1920*r), nh = round(1080*r);
-        dw = (640-nw)/2; dh = (640-nh)/2;
-
         if (camera_ctx.format == V4L2_PIX_FMT_BGR24) {
             rga_buffer_t src_rga;
             if (dma_fd >= 0) src_rga = wrapbuffer_fd(dma_fd, 1920, 1080, RK_FORMAT_BGR_888);
@@ -405,21 +474,10 @@ int main() {
              cv::cvtColor(letterbox_img, rgb_img, cv::COLOR_BGR2RGB);
         }
 
-        // Web UI Clone (If needed)
-        if (active_connections > 0 && web_mutex.try_lock()) {
-             cv::Mat wrapper(1080, 1920, CV_8UC3, raw_data);
-             web_data_buffer.img = wrapper.clone();
-             web_data_buffer.dets.clear();
-             web_data_buffer.valid = false;
-             web_mutex.unlock();
-        }
-
-        v4l2_manual_qbuf(&camera_ctx, current_idx);
-        auto t_pre_end = std::chrono::high_resolution_clock::now();
+        // Web Copy 移到了后面，以降低延迟
 
         // Inference
         int count = detect(ctx, rgb_img.data, CONF_THRES, NMS_THRES, dets, 50);
-        auto t_infer_end = std::chrono::high_resolution_clock::now();
 
         // Tracker & PID
         float min_dist = 1e9f;
@@ -428,6 +486,7 @@ int main() {
         
         for(int i=0; i<count; i++) {
             if (dets[i].class_id != 0) continue;
+
             float x1 = (dets[i].x1 - dw)/r, y1 = (dets[i].y1 - dh)/r;
             float x2 = (dets[i].x2 - dw)/r, y2 = (dets[i].y2 - dh)/r;
             float tcx = (x1 + x2) / 2.0f;
@@ -473,30 +532,52 @@ int main() {
             hid_buffer_x = 0; hid_buffer_y = 0;
         }
 
+        // 5. Offload Buffer to Web Thread (If available)
+        bool buffer_offloaded = false;
+        
         if (active_connections > 0) {
-            std::lock_guard<std::mutex> lock(web_mutex);
-            web_data_buffer.dets.assign(dets, dets + count);
-            web_data_buffer.r = r; web_data_buffer.dw = dw; web_data_buffer.dh = dh;
-            web_data_buffer.valid = true;
+             int expected = -1;
+             // Only try if web thread is asking/idle (idx == -1)
+             if (std::atomic_load(&web_transfer_buf_idx) == -1) {
+                // Populate params safely before swap
+                {
+                    std::lock_guard<std::mutex> lock(web_transfer_mutex);
+                    web_transfer_dets.assign(dets, dets + count);
+                }
+                web_transfer_r = r;
+                web_transfer_dw = dw;
+                web_transfer_dh = dh;
+                web_transfer_src_dma = dma_fd;
+                web_transfer_src_w = camera_ctx.width;
+                web_transfer_src_h = camera_ctx.height;
+                web_transfer_length = 0; // Not used for BGR24 path usually
+                web_transfer_data = raw_data;
+                
+                if (web_transfer_buf_idx.compare_exchange_strong(expected, current_idx)) {
+                    buffer_offloaded = true;
+                }
+             }
+        }
+        
+        if (!buffer_offloaded) {
+             v4l2_manual_qbuf(&camera_ctx, current_idx);
         }
 
         auto t_end = std::chrono::high_resolution_clock::now();
-        acc_total += std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        acc_pre += std::chrono::duration<double, std::milli>(t_pre_end - t_start).count(); // includes read
-        acc_infer += std::chrono::duration<double, std::milli>(t_infer_end - t_pre_end).count();
         frame_count++;
 
         if (std::chrono::duration<double>(t_end - last_print_time).count() >= 1.0) {
-            std::cout << std::fixed << std::setprecision(2)
-                      << "[FPS: " << frame_count << "] Total: " << (acc_total/frame_count) 
-                      << "ms (Pre: " << (acc_pre/frame_count) << ", NPU: " << (acc_infer/frame_count) << ")" 
-                      << "\r" << std::flush;
-            last_print_time = t_end; acc_total=0; acc_pre=0; acc_infer=0; frame_count=0;
+            std::cout << std::fixed << std::setprecision(1) << "[FPS: " << frame_count << "]\r" << std::flush;
+            last_print_time = t_end; frame_count=0;
         }
     }
     
     running = false;
     if(hid_thread.joinable()) hid_thread.join();
     if(web_thread.joinable()) web_thread.join();
+    if(web_proc_thread.joinable()) web_proc_thread.join();
+    
+    release_model(ctx);
+    v4l2_close(&camera_ctx);
     return 0;
 }
