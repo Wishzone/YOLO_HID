@@ -3,16 +3,11 @@
 
 #include <rknn_api.h>
 #include <stdbool.h>
+#include "../core/types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef struct {
-    float x1, y1, x2, y2;
-    float score;
-    int class_id;
-} Detection;
 
 void* init_model(const char* model_path);
 int detect(void* ctx_ptr, unsigned char* input_data, float conf_thres, float nms_thres, Detection* results, int max_results);

@@ -5,15 +5,10 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <rknn_api.h>
+#include "yolo_rknn.h"
 
 #define MAX_DETECTIONS 100
 #define DFL_REG 16
-
-typedef struct {
-    float x1, y1, x2, y2;
-    float score;
-    int class_id;
-} Detection;
 
 typedef struct {
     rknn_context ctx;

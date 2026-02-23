@@ -31,7 +31,7 @@ static float sigmoid(float x) {
 }
 
 // IOU for NMS
-static float iou(Detection26* a, Detection26* b) {
+static float iou(Detection* a, Detection* b) {
     float xx1 = fmaxf(a->x1, b->x1);
     float yy1 = fmaxf(a->y1, b->y1);
     float xx2 = fminf(a->x2, b->x2);
@@ -48,21 +48,21 @@ static float iou(Detection26* a, Detection26* b) {
 }
 
 static int compare_dets(const void* a, const void* b) {
-    Detection26* det_a = (Detection26*)a;
-    Detection26* det_b = (Detection26*)b;
+    Detection* det_a = (Detection*)a;
+    Detection* det_b = (Detection*)b;
     // Sort descending
     if (det_a->score > det_b->score) return -1;
     if (det_a->score < det_b->score) return 1;
     return 0;
 }
 
-static void nms_process(Detection26* dets, int* count, float threshold) {
+static void nms_process(Detection* dets, int* count, float threshold) {
     int keep[MAX_DETECTIONS];
     int keep_count = 0;
     int suppressed[MAX_DETECTIONS] = {0};
 
     // Sort by score descending (Optimized with qsort)
-    qsort(dets, *count, sizeof(Detection26), compare_dets);
+    qsort(dets, *count, sizeof(Detection), compare_dets);
 
     for (int i = 0; i < *count; i++) {
         if (suppressed[i]) continue;
@@ -173,7 +173,7 @@ void release_yolo26_model(void* ctx_ptr) {
     }
 }
 
-int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_thres, Detection26* results, int max_results) {
+int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_thres, Detection* results, int max_results) {
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
     if (!ctx || !ctx->is_init) return 0;
 
