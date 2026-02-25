@@ -12,9 +12,6 @@ OBJS_26 = models/yolo26_rknn.o main_yolo26.o $(COMMON_OBJS)
 all: $(TARGET_APP_26)
 
 $(TARGET_APP_26): $(OBJS_26)
-	$(CXX) -o $@ $(LDFLAGS)
-
-$(TARGET_APP_26): $(OBJS_26)
 	$(CXX) -o $@ $(OBJS_26) $(LDFLAGS)
 
 %.o: %.c
