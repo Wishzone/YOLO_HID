@@ -18,8 +18,7 @@
 #define MODEL_PATH "./Models/cf-26n-rk3588-int8_100.rknn"
 #define HID_DEVICE "/dev/hidg1"
 #define CAMERA_INDEX 20
-#define CONF_THRES 0.65f
-#define NMS_THRES 0.45f
+#define CONF_THRES 0.70f
 #define HTTP_PORT 8080
 #define MJPEG_QUALITY 80 
 
@@ -131,7 +130,7 @@ int main() {
         }
 
         // Inference
-        int count = detect_yolo26(ctx, rgb_img.data, CONF_THRES, NMS_THRES, dets, MAX_DETECTIONS);
+        int count = detect_yolo26(ctx, rgb_img.data, CONF_THRES, dets, MAX_DETECTIONS);
 
         // Tracker & PID
         float min_dist = 1e9f;

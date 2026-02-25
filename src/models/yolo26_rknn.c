@@ -173,7 +173,7 @@ void release_yolo26_model(void* ctx_ptr) {
     }
 }
 
-int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, float nms_thres, Detection* results, int max_results) {
+int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, Detection* results, int max_results) {
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
     if (!ctx || !ctx->is_init) return 0;
 
@@ -371,8 +371,8 @@ int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, floa
     
     rknn_outputs_release(ctx->ctx, ctx->io_num.n_output, outputs);
 
-    // NMS
-    nms_process(results, &det_count, nms_thres);
+    // NMS Removed as requested for YOLO26
+    // nms_process(results, &det_count, nms_thres);
 
     return det_count;
 }
