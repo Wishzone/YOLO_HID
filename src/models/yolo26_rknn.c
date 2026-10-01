@@ -15,6 +15,7 @@ typedef struct {
     bool is_init;
     bool raw_outputs;
     int scores_mode;
+    float nms_iou;
     rknn_input_output_num io_num;
     rknn_tensor_attr* input_attrs;
     rknn_tensor_attr* output_attrs;
@@ -68,6 +69,7 @@ void* init_yolo26_model(const char* model_path) {
     int ret;
     RKNN_Context* ctx = (RKNN_Context*)calloc(1, sizeof(RKNN_Context));
     if (ctx == NULL) return NULL;
+    ctx->nms_iou = 0.5f;
 
     int model_data_size = 0;
     unsigned char* model_data = load_model(model_path, &model_data_size);
@@ -182,6 +184,11 @@ void set_yolo26_scores_mode(void* ctx_ptr, int mode) {
     if (ctx && mode >= 0 && mode <= 2) ctx->scores_mode = mode;
 }
 
+void set_yolo26_nms_iou(void* ctx_ptr, float iou) {
+    RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
+    if (ctx && isfinite(iou) && iou > 0.0f && iou < 1.0f) ctx->nms_iou = iou;
+}
+
 int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, Detection* results, int max_results) {
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
     if (!ctx || !ctx->is_init || !img_data || !results || max_results <= 0) return -1;
@@ -219,9 +226,9 @@ int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, Dete
             heads[i].is_nhwc = nhwc;
             heads[i].scores_mode = ctx->scores_mode;
         }
-        count = yolo26_decode_raw_heads(heads, ctx->io_num.n_output,
+        count = yolo26_decode_raw_heads_nms(heads, ctx->io_num.n_output,
                                        ctx->model_width, ctx->model_height,
-                                       conf_thres, results, max_results);
+                                       conf_thres, ctx->nms_iou, results, max_results);
     } else {
         const rknn_tensor_attr* attr = &ctx->output_attrs[0];
         unsigned last = attr->n_dims - 1;

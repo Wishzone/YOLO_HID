@@ -7,7 +7,52 @@ static void close_to(float actual, float expected) {
     assert(fabsf(actual - expected) < 0.001f);
 }
 
+static void test_nms(void) {
+    Detection boxes[] = {
+        {0,0,100,100,0.7f,2}, {2,2,102,102,0.9f,2},
+        {2,2,102,102,0.8f,3}, {300,0,400,100,0.85f,2},
+        {0,0,0,100,0.99f,2}, {0,0,100,100,NAN,2}
+    };
+    assert(yolo26_nms(boxes, 6, 0.5f, 6) == 3);
+    close_to(boxes[0].score, 0.9f);
+    close_to(boxes[1].x1, 300);
+    assert(boxes[2].class_id == 3); // A head/body label must not suppress another class.
+
+    Detection chain[] = {
+        {0,0,100,100,0.9f,2}, {25,0,125,100,0.8f,2}, {50,0,150,100,0.7f,2}
+    };
+    assert(yolo26_nms(chain, 3, 0.5f, 3) == 2);
+    close_to(chain[1].x1, 50); // A suppressed middle box must not suppress the third target.
+
+    Detection tied[] = {{2,0,102,100,0.8f,2},{0,0,100,100,0.8f,2}};
+    assert(yolo26_nms(tied, 2, 0.5f, 1) == 1);
+    close_to(tied[0].x1, 0);
+    assert(yolo26_nms(tied, 1, NAN, 1) == -1);
+    assert(yolo26_nms(tied, 1, 0.0f, 1) == -1);
+    assert(yolo26_nms(tied, 1, 1.0f, 1) == -1);
+
+    // Early cells duplicate one object; a later, higher-score cell is a second
+    // object. The output limit must be applied after collecting and suppressing.
+    float candidates[] = {
+        0.5f,0.5f,1.5f,0.5f,0.8f,0,
+        1.5f,0.5f,0.5f,0.5f,0.85f,0,
+        0.5f,0.5f,0.5f,0.5f,0.9f,0
+    };
+    Yolo26RawHead head = {candidates,6,1,3,1,2};
+    Detection results[2];
+    assert(yolo26_decode_raw_heads_nms(&head,1,600,100,0.45f,0.5f,results,2) == 2);
+    close_to(results[0].x1,400);
+    close_to(results[0].score,0.9f);
+    close_to(results[1].score,0.85f);
+    assert(yolo26_decode_raw_heads_nms(&head,1,600,100,0.45f,0.5f,results,1) == 1);
+    close_to(results[0].x1,400);
+    Yolo26RawHead heads[2] = {head,head};
+    assert(yolo26_decode_raw_heads_nms(heads,2,600,100,0.45f,0.5f,results,2) == 2);
+    assert(yolo26_decode_raw_heads_nms(&head,1,600,100,0.99f,0.5f,results,2) == 0);
+}
+
 int main(void) {
+    test_nms();
     Detection results[4];
     float planar[24];
     for (int i = 0; i < 24; ++i) planar[i] = -20.0f;

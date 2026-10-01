@@ -1,6 +1,9 @@
 #include "yolo26_postprocess.h"
 #include <limits.h>
 #include <math.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
 
 static float clamp_coordinate(float value, int maximum) {
     return fmaxf(0.0f, fminf(value, (float)maximum));
@@ -81,7 +84,83 @@ int yolo26_decode_raw_heads(const Yolo26RawHead* heads, int head_count,
             }
         }
     }
-    // Keep the original no-NMS policy.
+    // This low-level decoder returns raw candidates; inference uses the NMS wrapper.
+    return count;
+}
+
+static int compare_detection_score(const void* left, const void* right) {
+    const Detection* a = (const Detection*)left;
+    const Detection* b = (const Detection*)right;
+    if (a->score != b->score) return a->score > b->score ? -1 : 1;
+    // Deterministic ties avoid switching between equally confident duplicates.
+    if (a->class_id != b->class_id) return a->class_id < b->class_id ? -1 : 1;
+    const float ac[] = {a->x1, a->y1, a->x2, a->y2};
+    const float bc[] = {b->x1, b->y1, b->x2, b->y2};
+    for (int i = 0; i < 4; ++i)
+        if (ac[i] != bc[i]) return ac[i] < bc[i] ? -1 : 1;
+    return 0;
+}
+
+static float detection_iou(const Detection* a, const Detection* b) {
+    const float width = fmaxf(0.0f, fminf(a->x2, b->x2) - fmaxf(a->x1, b->x1));
+    const float height = fmaxf(0.0f, fminf(a->y2, b->y2) - fmaxf(a->y1, b->y1));
+    const float intersection = width * height;
+    const float area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
+    const float area_b = (b->x2 - b->x1) * (b->y2 - b->y1);
+    const float union_area = area_a + area_b - intersection;
+    return union_area > 0.0f ? intersection / union_area : 0.0f;
+}
+
+int yolo26_nms(Detection* detections, int count, float iou_threshold, int capacity) {
+    if (!detections || count < 0 || capacity <= 0 || !isfinite(iou_threshold) ||
+        iou_threshold <= 0.0f || iou_threshold >= 1.0f) return -1;
+    int valid = 0;
+    for (int i = 0; i < count; ++i) {
+        Detection d = detections[i];
+        if (!isfinite(d.x1) || !isfinite(d.y1) || !isfinite(d.x2) || !isfinite(d.y2) ||
+            !isfinite(d.score) || d.class_id < 0 || d.score < 0.0f || d.score > 1.0f ||
+            d.x2 <= d.x1 || d.y2 <= d.y1) continue;
+        detections[valid++] = d;
+    }
+    qsort(detections, valid, sizeof(*detections), compare_detection_score);
+    int kept = 0;
+    for (int i = 0; i < valid && kept < capacity; ++i) {
+        const Detection candidate = detections[i];
+        int suppressed = 0;
+        for (int j = 0; j < kept; ++j) {
+            if (detections[j].class_id == candidate.class_id &&
+                detection_iou(&detections[j], &candidate) > iou_threshold) {
+                suppressed = 1;
+                break;
+            }
+        }
+        if (!suppressed) detections[kept++] = candidate;
+    }
+    return kept;
+}
+
+int yolo26_decode_raw_heads_nms(const Yolo26RawHead* heads, int head_count,
+                               int input_width, int input_height, float threshold,
+                               float iou_threshold, Detection* results, int capacity) {
+    if (!heads || head_count <= 0 || !results || capacity <= 0 ||
+        input_width <= 0 || input_height <= 0 || !isfinite(iou_threshold) ||
+        iou_threshold <= 0.0f || iou_threshold >= 1.0f) return -1;
+    int candidate_capacity = 0;
+    for (int i = 0; i < head_count; ++i) {
+        if (!heads[i].data || heads[i].channels <= 4 || heads[i].height <= 0 ||
+            heads[i].width <= 0 || heads[i].width > INT_MAX / heads[i].height) return -1;
+        int cells = heads[i].height * heads[i].width;
+        if (candidate_capacity > INT_MAX - cells) return -1;
+        candidate_capacity += cells;
+    }
+    if ((size_t)candidate_capacity > SIZE_MAX / sizeof(Detection)) return -1;
+    Detection* candidates = (Detection*)malloc((size_t)candidate_capacity * sizeof(Detection));
+    if (!candidates) return -1;
+    int count = yolo26_decode_raw_heads(heads, head_count, input_width, input_height,
+                                      threshold, candidates, candidate_capacity);
+    if (count >= 0) count = yolo26_nms(candidates, count, iou_threshold, capacity);
+    if (count > 0) memcpy(results, candidates, (size_t)count * sizeof(Detection));
+    free(candidates);
     return count;
 }
 

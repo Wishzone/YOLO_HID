@@ -5,6 +5,8 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <signal.h>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/logger.hpp>
@@ -47,6 +49,7 @@ int main(int argc, char* argv[]) {
     std::string model_path = MODEL_PATH;
     bool check_model = false;
     int scores_mode = 0;
+    float nms_iou = 0.5f;
     std::string hid_device = HID_DEVICE;
     bool hid_enabled = true;
     std::vector<int> target_classes{0};
@@ -55,6 +58,7 @@ int main(int argc, char* argv[]) {
         if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: " << argv[0] << " [--model PATH] [--scores auto|logits|probabilities] [--check-model]\n"
                       << "  [--hid-device PATH] [--no-hid] [--start-paused] [--target-classes all|0,1,...]\n"
+                      << "  [--nms-iou VALUE] Raw-head duplicate suppression IoU, default 0.5 (0 < VALUE < 1).\n"
                       << "Default model: " << MODEL_PATH << "\n"
                       << "--check-model runs one NPU inference without camera, Web or HID.\n";
             return 0;
@@ -83,6 +87,14 @@ int main(int argc, char* argv[]) {
                 }
                 if (target_classes.empty() || classes.back() == ',') return 2;
             }
+        } else if (argument == "--nms-iou" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            try {
+                size_t consumed = 0;
+                nms_iou = std::stof(value, &consumed);
+                if (consumed != value.size() || !std::isfinite(nms_iou) || nms_iou <= 0 || nms_iou >= 1)
+                    throw std::invalid_argument("IoU");
+            } catch (...) { std::cerr << "Invalid NMS IoU: " << value << std::endl; return 2; }
         } else if (argument == "--scores" && i + 1 < argc) {
             const std::string mode = argv[++i];
             if (mode == "auto") scores_mode = 0;
@@ -107,6 +119,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     set_yolo26_scores_mode(ctx, scores_mode);
+    set_yolo26_nms_iou(ctx, nms_iou);
     if (check_model) {
         cv::Mat input(640, 640, CV_8UC3, cv::Scalar(114, 114, 114));
         Detection detections[MAX_DETECTIONS];
