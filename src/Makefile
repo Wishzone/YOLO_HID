@@ -1,6 +1,7 @@
 CXX ?= g++
 CC ?= gcc
 PKG_CONFIG ?= pkg-config
+PYTHON ?= python3
 CPPFLAGS += -I/usr/include $(shell $(PKG_CONFIG) --cflags opencv4)
 CFLAGS ?= -O3 -fPIC
 CXXFLAGS ?= -O3 -std=c++11
@@ -52,5 +53,6 @@ test: ../build/test_postprocess ../build/test_hid ../build/test_web
 	../build/test_postprocess
 	../build/test_hid
 	../build/test_web
+	$(PYTHON) ../tests/test_edid.py
 
 -include $(DEPS)

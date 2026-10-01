@@ -1,340 +1,139 @@
+"""Generate a two-block HDMI 2.0 EDID for RK3588 HDMI input.
+
+60/120 Hz use CTA timings. Higher modes use short, representable porches;
+165/240 Hz match timings accepted by the source's existing gaming monitor.
+The preferred mode stays at 60 Hz so reconnecting does not force a high rate.
+"""
+import argparse
+import math
 import struct
+from pathlib import Path
 
-def calculate_cvt_rb(width, height, refresh_rate):
-    # Constants for CVT-RB
-    H_BLANK = 160
-    CLOCK_STEP = 0.25
-    MIN_V_BPORCH = 3
-    V_SYNC = 5
-    MIN_V_PORCH_RND = 3
-    
-    # 1. Estimate Horizontal Period (kHZ)
-    # H_PERIOD_EST = ((1/V_FIELD_RATE) - MIN_V_BLANK) / (Y_PIXELS + 2*V_MARGIN + MIN_V_PORCH_RND + INTERLACED)
-    # Simplified for RB:
-    # Total V lines = V Active + V_BLANK_RB
-    # V_BLANK_RB = 460 (fixed for RBv2?) No, let's use standard CVT-RB v1
-    # V_BLANK = 3 + 5 + 3 + (V_SYNC etc) ... actually RB is fixed blanking time usually.
-    
-    # Let's use the standard CVT-RB formula
-    # H Period = 1 / (Refresh * (V_LINES + V_BLANK))
-    # But we need to find Pixel Clock.
-    
-    # CVT-RB Timing:
-    # H Blank is fixed at 160 pixels.
-    # H Sync is 32 pixels.
-    # V Blank is fixed? No.
-    # V Sync is fixed at 5 lines.
-    # V Back Porch is fixed at 3 lines?
-    # V Front Porch is variable?
-    
-    # Actually, let's use a known modeline for 1920x1080 @ 165Hz (CVT-RB)
-    # Modeline "1920x1080_165.00"  380.98  1920 1968 2000 2080  1080 1083 1088 1111 +hsync -vsync
-    # Pixel Clock: 380.98 MHz
-    # H Active: 1920
-    # H Front Porch: 48
-    # H Sync: 32
-    # H Back Porch: 80
-    # H Total: 2080
-    # V Active: 1080
-    # V Front Porch: 3
-    # V Sync: 5
-    # V Back Porch: 23
-    # V Total: 1111
-    
-    # Refresh = 380980000 / (2080 * 1111) = 164.86 Hz (~165Hz)
-    
-    return {
-        "pixel_clock": 38098, # in 10kHz
-        "h_active": 1920,
-        "h_blank": 160, # 2080 - 1920
-        "v_active": 1080,
-        "v_blank": 31, # 1111 - 1080
-        "h_sync_offset": 48, # Front Porch
-        "h_sync_width": 32,
-        "v_sync_offset": 3, # Front Porch
-        "v_sync_width": 5,
-        "h_size_mm": 527, # Example 24 inch
-        "v_size_mm": 296,
-        "flags": 0x18 # Digital, +HSync, -VSync (Wait, CVT-RB is usually +H -V? Or +H +V?)
-                      # Standard CVT-RB is +H -V usually? 
-                      # Let's check flags. 
-                      # Bit 7: 0 (Analog) / 1 (Digital) -> DTD is different? No, this is for separate sync.
-                      # 0x1E = Digital, +H, +V. 
-                      # 0x18 = Digital, +H, +V (bits 1,2 are sync polarity).
-                      # Bit 2: V Sync Polarity (1=Positive)
-                      # Bit 1: H Sync Polarity (1=Positive)
-                      # CVT-RB is usually +H -V (0x1A) or -H +V?
-                      # Actually, let's stick to 0x1E (+H +V) or 0x18 (+H +V, no stereo).
-                      # The example 1080p60 EDID had 0x1E (+H +V).
-    }
 
-def create_dtd(timing):
+def timing(refresh):
+    if refresh in (60, 120):
+        return dict(pixel_clock=14850 * (refresh // 60), h_active=1920,
+                    h_blank=280, v_active=1080, v_blank=45,
+                    h_sync_offset=88, h_sync_width=44,
+                    v_sync_offset=4, v_sync_width=5, flags=0x1E)
+    if refresh not in (144, 165, 180, 240):
+        raise ValueError('Unsupported refresh rate')
+    # Source-tested reduced-blanking HDMI timings (not CVT formula timings).
+    h_blank = 150 if refresh == 240 else 160
+    return dict(pixel_clock=math.ceil((1920 + h_blank) * 1125 * refresh / 10000),
+                h_active=1920, h_blank=h_blank, v_active=1080, v_blank=45,
+                h_sync_offset=48, h_sync_width=32,
+                v_sync_offset=4, v_sync_width=5, flags=0x1A)
+
+
+def create_dtd(t):
+    pc = t['pixel_clock']
+    ha, hb = t['h_active'], t['h_blank']
+    va, vb = t['v_active'], t['v_blank']
+    hso, hsw = t['h_sync_offset'], t['h_sync_width']
+    vso, vsw = t['v_sync_offset'], t['v_sync_width']
+    if not (0 < pc <= 60000 and 0 < ha <= 4095 and 0 < va <= 4095 and
+            0 < hb <= 4095 and 0 < vb <= 4095 and 0 < hso <= 1023 and
+            0 < hsw <= 1023 and 0 < vso <= 63 and 0 < vsw <= 63 and
+            hso + hsw < hb and vso + vsw < vb):
+        raise ValueError('Timing cannot be represented safely by an EDID DTD')
     dtd = bytearray(18)
-    
-    # 0-1: Pixel Clock
-    pc = timing["pixel_clock"]
-    dtd[0] = pc & 0xFF
-    dtd[1] = (pc >> 8) & 0xFF
-    
-    # 2: H Active
-    ha = timing["h_active"]
-    dtd[2] = ha & 0xFF
-    
-    # 3: H Blanking
-    hb = timing["h_blank"]
-    dtd[3] = hb & 0xFF
-    
-    # 4: H Active/Blanking upper bits
-    dtd[4] = ((ha >> 8) & 0xF) << 4 | ((hb >> 8) & 0xF)
-    
-    # 5: V Active
-    va = timing["v_active"]
-    dtd[5] = va & 0xFF
-    
-    # 6: V Blanking
-    vb = timing["v_blank"]
-    dtd[6] = vb & 0xFF
-    
-    # 7: V Active/Blanking upper bits
-    dtd[7] = ((va >> 8) & 0xF) << 4 | ((vb >> 8) & 0xF)
-    
-    # 8: H Sync Offset
-    hso = timing["h_sync_offset"]
-    dtd[8] = hso & 0xFF
-    
-    # 9: H Sync Pulse Width
-    hspw = timing["h_sync_width"]
-    dtd[9] = hspw & 0xFF
-    
-    # 10: V Sync Offset/Pulse Width
-    vso = timing["v_sync_offset"]
-    vspw = timing["v_sync_width"]
-    dtd[10] = ((vso & 0xF) << 4) | (vspw & 0xF)
-    
-    # 11: Upper bits for Sync
-    dtd[11] = ((hso >> 8) & 0x3) << 6 | ((hspw >> 8) & 0x3) << 4 | ((vso >> 4) & 0x3) << 2 | ((vspw >> 4) & 0x3)
-    
-    # 12: H Image Size
-    hsz = timing["h_size_mm"]
-    dtd[12] = hsz & 0xFF
-    
-    # 13: V Image Size
-    vsz = timing["v_size_mm"]
-    dtd[13] = vsz & 0xFF
-    
-    # 14: Upper bits for Image Size
-    dtd[14] = ((hsz >> 8) & 0xF) << 4 | ((vsz >> 8) & 0xF)
-    
-    # 15: H Border
-    dtd[15] = 0
-    
-    # 16: V Border
-    dtd[16] = 0
-    
-    # 17: Flags
-    # 0x18: Digital, Separate Sync, +H, +V (Wait, 0x18 is +H +V?)
-    # Bit 7: 0
-    # Bit 6-5: 00 (Normal)
-    # Bit 4: 1 (Digital Separate)
-    # Bit 3: 1 (Reserved/Stereo?) -> Usually 1 for Digital Separate? No.
-    # Bit 2: V Polarity (1=Pos)
-    # Bit 1: H Polarity (1=Pos)
-    # 0x1E = 0001 1110 -> Digital Separate, V+, H+
-    dtd[17] = 0x1E 
-    
+    dtd[0:2] = struct.pack('<H', pc)
+    dtd[2:5] = bytes((ha & 255, hb & 255, (ha >> 8) << 4 | hb >> 8))
+    dtd[5:8] = bytes((va & 255, vb & 255, (va >> 8) << 4 | vb >> 8))
+    dtd[8:12] = bytes((hso & 255, hsw & 255, (vso & 15) << 4 | vsw & 15,
+                      (hso >> 8) << 6 | (hsw >> 8) << 4 | (vso >> 4) << 2 | vsw >> 4))
+    dtd[12:15] = bytes((527 & 255, 296 & 255, (527 >> 8) << 4 | 296 >> 8))
+    dtd[17] = t['flags']
     return dtd
 
-def generate_edid():
-    # Base EDID (128 bytes)
-    # Header
-    edid = bytearray(b'\x00\xFF\xFF\xFF\xFF\xFF\xFF\x00')
-    
-    # Vendor/Product ID (Manufacturer: RPI, Product: 1234)
-    # RPI = 0x49 0x70 (from dump)
-    # ID (2), Product (2), Serial (4), Week (1), Year (1) = 10 bytes
-    edid += bytearray(b'\x49\x70\x88\x35\x01\x00\x00\x00\x01\x1E') # Added Week/Year
-    
-    # Edid Version 1.3
-    edid += bytearray(b'\x01\x03')
-    
-    # Basic Display Params
-    # Digital, 8 bits, etc.
-    edid += bytearray(b'\x80\x34\x20\x78\x22') # Input, H/V cm, Gamma
-    
-    # Chromaticity (sRGB)
-    edid += bytearray(b'\xEE\x91\xA3\x54\x4C\x99\x26\x0F\x50\x54')
-    
-    # Established Timings (720x400@70, 640x480@60, 800x600@60, 1024x768@60)
-    edid += bytearray(b'\xA5\x4B\x00')
-    
-    # Standard Timings (1920x1080@60, etc)
-    # 0xD1C0 = 1920x1080 @ 60Hz (16:9)
-    # 0x8180 = 1280x1024 @ 60Hz
-    # 0x6140 = 1024x768 @ 60Hz
-    # 0x4540 = 800x600 @ 60Hz
-    # 0x3140 = 640x480 @ 60Hz
-    # ...
-    edid += bytearray(b'\xD1\xC0\x81\x80\x61\x40\x45\x40\x31\x40\x01\x01\x01\x01\x01\x01')
-    
-    # Descriptor 1: 1920x1080 @ 240Hz (Preferred)
-    # Based on BenQ XL2546 timings (CVT-RB)
-    # Pixel Clock: 567.00 MHz
-    # H Total: 2080, V Total: 1136
-    timing_240 = {
-        "pixel_clock": 56700, # 567.00 MHz
-        "h_active": 1920,
-        "h_blank": 160,
-        "v_active": 1080,
-        "v_blank": 56, # 1136 - 1080
-        "h_sync_offset": 48,
-        "h_sync_width": 32,
-        "v_sync_offset": 3,
-        "v_sync_width": 5,
-        "h_size_mm": 527,
-        "v_size_mm": 296
-    }
-    edid += create_dtd(timing_240)
-    
-    # Descriptor 2: 1920x1080 @ 180Hz
-    # Pixel Clock: 419.33 MHz
-    # H Total: 2080, V Total: 1120
-    timing_180 = {
-        "pixel_clock": 41933,
-        "h_active": 1920,
-        "h_blank": 160,
-        "v_active": 1080,
-        "v_blank": 40,
-        "h_sync_offset": 48,
-        "h_sync_width": 32,
-        "v_sync_offset": 3,
-        "v_sync_width": 5,
-        "h_size_mm": 527,
-        "v_size_mm": 296
-    }
-    edid += create_dtd(timing_180)
-    
-    # Descriptor 3: Monitor Name
-    # 00 00 00 FC 00 ...
-    name = b"RK3588-Multi"
-    desc3 = bytearray(b'\x00\x00\x00\xFC\x00') + name + b'\x0A' + b'\x20' * (12 - len(name))
-    edid += desc3
-    
-    # Descriptor 4: Range Limits
-    # 00 00 00 FD 00 ...
-    # Min V: 48, Max V: 240, Min H: 30, Max H: 255 (kHz), Max Clock: 600 (MHz)
-    desc4 = bytearray(b'\x00\x00\x00\xFD\x00\x30\xF0\x1E\xFF\x3C\x00\x0A\x20\x20\x20\x20\x20\x20')
-    edid += desc4
-    
-    # Extension Flag (1) - We will add a CTA-861 Extension Block
-    edid += bytearray(b'\x01')
-    
-    # Checksum for Block 0
-    checksum = 0
-    for b in edid:
-        checksum += b
-    checksum = (256 - (checksum % 256)) % 256
-    edid += bytearray([checksum])
-    
-    # --- Block 1: CTA-861 Extension ---
-    cta = bytearray(128)
-    cta[0] = 0x02 # Tag: CTA-861
-    cta[1] = 0x03 # Revision 3
-    
-    # Offset to DTDs.
-    # We will have 2 DTDs in Block 1: 165Hz and 60Hz
-    
-    idx = 4 # Start of Data Blocks
-    
-    # 1. Video Data Block (SVD)
-    # Tag: 2 (010), Length: 1 -> 0x41
-    # SVD: 1080p60 (VIC 16) | Native (0x90)
-    cta[idx] = 0x41
-    cta[idx+1] = 0x90 # VIC 16 (1080p60) Native
-    idx += 2
-    
-    # 2. HDMI VSDB (HDMI 1.4)
-    # Tag: 3 (011), Length: 8
-    # Header: (3 << 5) | 8 = 0x68
-    cta[idx] = 0x68
-    cta[idx+1] = 0x03
-    cta[idx+2] = 0x0C
-    cta[idx+3] = 0x00
-    cta[idx+4] = 0x10 # PA 1.0
-    cta[idx+5] = 0x00 # PA 0.0
-    cta[idx+6] = 0x00 # Flags
-    cta[idx+7] = 0x44 # Max TMDS 340MHz
-    cta[idx+8] = 0x00 # Video Latency
-    cta[idx+9] = 0x00 # Audio Latency
-    idx += 10
-    
-    # 3. HDMI Forum VSDB (HDMI 2.0)
-    # Tag: 3 (011), Length: 6
-    # Header: (3 << 5) | 6 = 0x66
-    cta[idx] = 0x66
-    cta[idx+1] = 0xD8
-    cta[idx+2] = 0x5D
-    cta[idx+3] = 0xC4
-    cta[idx+4] = 0x01 # Version
-    cta[idx+5] = 0x78 # Max TMDS 600MHz
-    cta[idx+6] = 0x80 # SCDC Present
-    idx += 7
-    
-    # DTD Start Offset
-    cta[2] = idx
-    
-    # DTD 1: 1920x1080 @ 165Hz
-    timing_165 = {
-        "pixel_clock": 38098,
-        "h_active": 1920,
-        "h_blank": 160,
-        "v_active": 1080,
-        "v_blank": 31,
-        "h_sync_offset": 48,
-        "h_sync_width": 32,
-        "v_sync_offset": 3,
-        "v_sync_width": 5,
-        "h_size_mm": 527,
-        "v_size_mm": 296
-    }
-    dtd_165 = create_dtd(timing_165)
-    for i in range(18):
-        cta[idx+i] = dtd_165[i]
-    idx += 18
-    
-    # DTD 2: 1920x1080 @ 60Hz
-    timing_60 = {
-        "pixel_clock": 14850,
-        "h_active": 1920,
-        "h_blank": 280,
-        "v_active": 1080,
-        "v_blank": 45,
-        "h_sync_offset": 88,
-        "h_sync_width": 44,
-        "v_sync_offset": 4,
-        "v_sync_width": 5,
-        "h_size_mm": 527,
-        "v_size_mm": 296
-    }
-    dtd_60 = create_dtd(timing_60)
-    for i in range(18):
-        cta[idx+i] = dtd_60[i]
-    idx += 18
-    
-    # Padding with 0s (already 0)
-    
-    # Checksum for Block 1
-    checksum = 0
-    for b in cta:
-        checksum += b
-    checksum = (256 - (checksum % 256)) % 256
-    cta[127] = checksum
-    
-    edid += cta
-    
-    return edid
 
-if __name__ == "__main__":
-    edid_data = generate_edid()
-    with open("1080p_multi_hz.edid", "wb") as f:
-        f.write(edid_data)
-    print("Generated 1080p_multi_hz.edid")
+def data_block(tag, payload):
+    if not 0 < len(payload) <= 31:
+        raise ValueError('Invalid CTA data block length')
+    return bytes((tag << 5 | len(payload),)) + bytes(payload)
+
+
+def checksum(block):
+    block[127] = (-sum(block[:127])) & 255
+
+
+def validate_edid(data):
+    if len(data) < 128 or len(data) % 128 or data[:8] != b'\x00\xff\xff\xff\xff\xff\xff\x00':
+        raise ValueError('Invalid EDID header or block size')
+    if len(data) != (data[126] + 1) * 128:
+        raise ValueError('EDID extension count does not match file size')
+    for offset in range(0, len(data), 128):
+        block = data[offset:offset+128]
+        if sum(block) % 256:
+            raise ValueError(f'Invalid checksum in block {offset // 128}')
+        if offset == 0 or block[0] != 2:
+            continue
+        end = block[2]
+        if not 4 <= end <= 127:
+            raise ValueError('Invalid CTA DTD offset')
+        index, previous_hdmi = 4, False
+        while index < end:
+            tag, size = block[index] >> 5, block[index] & 31
+            if index + 1 + size > end:
+                raise ValueError('CTA data block exceeds its declared boundary')
+            payload = block[index+1:index+1+size]
+            oui = payload[:3] if tag == 3 else b''
+            if oui == b'\xd8\x5d\xc4':
+                if size < 7 or not previous_hdmi:
+                    raise ValueError('HDMI Forum block is truncated or is not directly after HDMI block')
+                if payload[6] & 0xF0:
+                    raise ValueError('This HDMI 2.0 profile must not advertise an FRL mode')
+            previous_hdmi = oui == b'\x03\x0c\x00'
+            index += 1 + size
+
+
+def generate_edid():
+    base = bytearray(128)
+    base[:8] = b'\x00\xff\xff\xff\xff\xff\xff\x00'
+    base[8:18] = b'\x49\x70\x88\x35\x01\x00\x00\x00\x01\x24'
+    base[18:25] = b'\x01\x03\x80\x35\x1e\x78\x06'  # HDMI requires EDID 1.3; digital, sRGB, preferred
+    base[25:35] = b'\xee\x91\xa3\x54\x4c\x99\x26\x0f\x50\x54'
+    base[35:38] = b'\x21\x08\x00'  # VGA60, SVGA60, XGA60; no legacy 75-Hz-only fallback
+    base[38:54] = b'\xd1\xc0' + b'\x01\x01' * 7
+    base[54:72] = create_dtd(timing(60))
+    base[72:90] = create_dtd(timing(144))
+    base[90:108] = b'\x00\x00\x00\xfc\x00RK3588-Multi\n'
+    # EDID 1.3 saturates the horizontal range at 255 kHz; individual DTDs
+    # carry the higher horizontal frequency for 240 Hz explicitly.
+    base[108:126] = b'\x00\x00\x00\xfd\x00\x32\xf0\x1e\xff\x3c\x00\x0a' + b' ' * 6
+    base[126] = 1
+    checksum(base)
+
+    cta = bytearray(128)
+    cta[0:4] = b'\x02\x03\x00\x81'  # Underscanned IT formats, RGB only, one native DTD
+    blocks = (
+        data_block(2, b'\x10\x3f') +  # CTA 1080p60/120; native 60 Hz is marked in the DTD list
+        data_block(3, b'\x03\x0c\x00\x10\x00\x00\x44') +
+        data_block(3, b'\xd8\x5d\xc4\x01\x78\x80\x00') +  # 600 MHz, SCDC; no FRL
+        data_block(7, b'\x00\x4a')  # Selectable RGB range, underscanned IT/CE
+    )
+    index = 4 + len(blocks)
+    cta[4:index] = blocks
+    cta[2] = index
+    for refresh in (60, 120, 165, 180, 240):
+        cta[index:index+18] = create_dtd(timing(refresh))
+        index += 18
+    checksum(cta)
+    result = bytes(base + cta)
+    validate_edid(result)
+    return result
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=Path('1080p_multi_hz.edid'))
+    parser.add_argument('--check', type=Path, help='Validate an existing EDID without writing')
+    args = parser.parse_args()
+    if args.check:
+        validate_edid(args.check.read_bytes())
+        print(f'EDID structure/checksums valid: {args.check}')
+    else:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_bytes(generate_edid())
+        print(f'Generated {args.output}: 1080p 60/120/144/165/180/240 Hz (advertised modes)')

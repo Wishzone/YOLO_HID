@@ -11,6 +11,46 @@ fi
 
 gadget=g1
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+VIDEO_DEV="${VIDEO_DEV:-/dev/video20}"
+EDID_FILE="${HDMI_EDID_FILE:-$SCRIPT_DIR/Models/1080p_multi_hz.edid}"
+
+# Apply only a valid EDID, then verify the actual receiver bytes.
+setup_hdmi_edid() (
+    command -v v4l2-ctl >/dev/null || { echo '[HDMI] Missing v4l2-ctl' >&2; return 1; }
+    [ -e "$VIDEO_DEV" ] || { echo "[HDMI] Missing $VIDEO_DEV" >&2; return 1; }
+    if [ ! -f "$EDID_FILE" ]; then
+        python3 "$SCRIPT_DIR/tools/gen_edid.py" --output "$EDID_FILE" || return 1
+    fi
+    python3 "$SCRIPT_DIR/tools/gen_edid.py" --check "$EDID_FILE" || return 1
+    work="$(mktemp -d /tmp/yolo-edid.XXXXXXXX)" || return 1
+    trap 'rm -f -- "$work/active.edid" "$work/check.log"; rmdir -- "$work"' EXIT
+    if command -v edid-decode >/dev/null; then
+        if ! edid-decode --check "$EDID_FILE" > "$work/check.log" 2>&1; then
+            cat "$work/check.log" >&2
+            echo '[HDMI] EDID validation failed; receiver was not changed.' >&2
+            return 1
+        fi
+    fi
+    if v4l2-ctl -d "$VIDEO_DEV" --get-edid="pad=0,format=raw,file=$work/active.edid" &&
+       cmp -s "$EDID_FILE" "$work/active.edid"; then
+        echo '[HDMI] EDID already active (read-back verified).'
+        return 0
+    fi
+    if ! v4l2-ctl -d "$VIDEO_DEV" --set-edid="pad=0,file=$EDID_FILE,format=raw"; then
+        echo '[HDMI] EDID write failed. Stop video capture before retrying ./setup.sh edid.' >&2
+        return 1
+    fi
+    if ! v4l2-ctl -d "$VIDEO_DEV" --get-edid="pad=0,format=raw,file=$work/active.edid" ||
+       ! cmp -s "$EDID_FILE" "$work/active.edid"; then
+        echo '[HDMI] EDID read-back differs from the requested file.' >&2
+        return 1
+    fi
+    echo '[HDMI] EDID loaded and read-back verified. Choose the refresh rate on the source computer.'
+)
+
+hdmi_status() {
+    v4l2-ctl -d "$VIDEO_DEV" --query-dv-timings --get-dv-timings-cap
+}
 
 # --- 1. Performance Settings ---
 setup_performance() {
@@ -55,17 +95,11 @@ setup_latency() {
     done
 
     # V4L2 Settings (HDMI IN)
-    VIDEO_DEV=/dev/video20
     if [ -e $VIDEO_DEV ]; then
         # Disable auto-exposure/focus if they exist
         v4l2-ctl -d $VIDEO_DEV -c exposure_auto=1 2>/dev/null
         v4l2-ctl -d $VIDEO_DEV -c focus_auto=0 2>/dev/null
         
-        # Load Custom EDID for 1080p Multi-Hz (240/180/165/60)
-        EDID_FILE="$SCRIPT_DIR/Models/1080p_multi_hz.edid"
-        if [ -f "$EDID_FILE" ]; then
-            v4l2-ctl -d $VIDEO_DEV --set-edid=file="$EDID_FILE",format=raw --fix-edid-checksums
-        fi
     fi
 
     # Kernel Parameters (Scheduler & VM)
@@ -94,6 +128,11 @@ setup_latency() {
 
 # --- 3. HID Gadget Settings ---
 start_hid_gadget(){ 
+    if [ -r "/sys/kernel/config/usb_gadget/${gadget}/UDC" ] &&
+       [ "$(cat "/sys/kernel/config/usb_gadget/${gadget}/UDC")" = fc000000.usb ]; then
+        echo '[HID] USB gadget is already bound.'
+        return 0
+    fi
     has_mount=$(mount -l | grep /sys/kernel/config)
     if [[ -z  $has_mount ]];then
         mount -t configfs none /sys/kernel/config
@@ -200,15 +239,24 @@ case $1 in
     start)
         setup_performance
         setup_latency
-        start_hid_gadget
+        setup_hdmi_edid || exit 1
+        start_hid_gadget || exit 1
         echo "=== Setup Complete ==="
         ;;
     stop)
         stop_hid_gadget
         ;;
+    edid)
+        setup_hdmi_edid || exit 1
+        ;;
+    edid-status)
+        hdmi_status
+        ;;
     *)
-        echo "Usage: $0 (start | stop)"
+        echo "Usage: $0 (start | stop | edid | edid-status)"
         echo "  start: Set performance mode, optimize latency, and start HID gadget"
         echo "  stop : Stop HID gadget"
+        echo "  edid : Validate, load and read-back verify HDMI input EDID"
+        echo "  edid-status : Show the actual HDMI signal and receiver capabilities"
         ;;
 esac
