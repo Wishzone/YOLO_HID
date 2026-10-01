@@ -86,7 +86,7 @@ def check_pt_model(model_path, verbose=False):
             
             model_info_str = capture_buf.getvalue().strip()
             if model_info_str:
-                # Example: "YOLO11n summary: ..."
+                # Example: "YOLO26n summary: ..."
                 first_line = model_info_str.split('\n')[0]
                 if "summary" in first_line:
                     info['type'] = first_line.split("summary")[0].strip()
@@ -193,27 +193,31 @@ def check_rknn_model(model_path, verbose=False):
         else:
             result_info['input_size'] = f"{input_size}x{input_size}"
             
-            if len(outputs) == 1:
+            if len(outputs) == 1 and outputs[0].ndim in (2, 3) and 6 in outputs[0].shape[-2:]:
+                result_info['type'] = "YOLO26 (end-to-end XYXY detections)"
+                result_info['note'] = "Class indices are returned directly; class count is not encoded in this shape"
+            elif len(outputs) == 1:
                 out_tensor = outputs[0]
                 if out_tensor.ndim == 3:
                     channels = out_tensor.shape[1]
                     anchors = out_tensor.shape[2]
                     nc = channels - 4
-                    result_info['type'] = "YOLOv8 / YOLO11"
+                    result_info['type'] = "YOLO26 (single-output detection)"
                     result_info['class_count'] = nc
                     
                     inferred_size = int(np.sqrt(anchors * 1024 / 21))
                     if input_size != inferred_size:
                         result_info['note'] = f"Model structure suggests {inferred_size}x{inferred_size}"
 
-            elif len(outputs) == 3:
-                result_info['type'] = "YOLOv5 / YOLOv7"
+            elif len(outputs) == 3 and all(t.ndim == 4 for t in outputs):
+                result_info['type'] = "Raw multi-scale detection heads (verify model export format)"
                 out0 = outputs[0]
                 if out0.ndim == 4:
                     c = out0.shape[1]
-                    if c % 3 == 0:
-                        nc = (c // 3) - 5
-                        result_info['class_count'] = nc
+                    if c in (6, 8):
+                        result_info['type'] = "YOLO26-compatible raw heads (4 box channels + class scores)"
+                        result_info['class_count'] = c - 4
+                    result_info['note'] = f"Output shapes: {[list(t.shape) for t in outputs]}"
             
             else:
                 result_info['type'] = f"Unknown ({len(outputs)} outputs)"

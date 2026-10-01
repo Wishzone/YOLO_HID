@@ -3,84 +3,24 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <rknn_api.h>
 #include "yolo26_rknn.h"
+#include "yolo26_postprocess.h"
 
-#define MAX_DETECTIONS 100
-
-// Standard YOLOv5 Anchors (640x640)
-// Stride 8, 16, 32
-static const float anchors[3][6] = {
-    {10.0, 13.0, 16.0, 30.0, 33.0, 23.0},   // P3
-    {30.0, 61.0, 62.0, 45.0, 59.0, 119.0},  // P4
-    {116.0, 90.0, 156.0, 198.0, 373.0, 326.0} // P5
-};
+// Supports raw YOLO26 feature maps and end-to-end XYXY detections.
 
 typedef struct {
     rknn_context ctx;
     bool is_init;
+    bool raw_outputs;
+    int scores_mode;
     rknn_input_output_num io_num;
     rknn_tensor_attr* input_attrs;
     rknn_tensor_attr* output_attrs;
     int model_width;
     int model_height;
 } RKNN_Context;
-
-static float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
-// IOU for NMS
-static float iou(Detection* a, Detection* b) {
-    float xx1 = fmaxf(a->x1, b->x1);
-    float yy1 = fmaxf(a->y1, b->y1);
-    float xx2 = fminf(a->x2, b->x2);
-    float yy2 = fminf(a->y2, b->y2);
-
-    float w = fmaxf(0.0f, xx2 - xx1);
-    float h = fmaxf(0.0f, yy2 - yy1);
-    float inter = w * h;
-
-    float area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
-    float area_b = (b->x2 - b->x1) * (b->y2 - b->y1);
-
-    return inter / (area_a + area_b - inter);
-}
-
-static int compare_dets(const void* a, const void* b) {
-    Detection* det_a = (Detection*)a;
-    Detection* det_b = (Detection*)b;
-    // Sort descending
-    if (det_a->score > det_b->score) return -1;
-    if (det_a->score < det_b->score) return 1;
-    return 0;
-}
-
-static void nms_process(Detection* dets, int* count, float threshold) {
-    int keep[MAX_DETECTIONS];
-    int keep_count = 0;
-    int suppressed[MAX_DETECTIONS] = {0};
-
-    // Sort by score descending (Optimized with qsort)
-    qsort(dets, *count, sizeof(Detection), compare_dets);
-
-    for (int i = 0; i < *count; i++) {
-        if (suppressed[i]) continue;
-        keep[keep_count++] = i;
-        for (int j = i + 1; j < *count; j++) {
-            if (suppressed[j]) continue;
-            if (iou(&dets[i], &dets[j]) > threshold) {
-                suppressed[j] = 1;
-            }
-        }
-    }
-
-    // Compact
-    for (int i = 0; i < keep_count; i++) {
-        dets[i] = dets[keep[i]];
-    }
-    *count = keep_count;
-}
 
 static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz)
 {
@@ -92,7 +32,10 @@ static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz)
     if (ret != 0) return NULL;
     data = (unsigned char *)malloc(sz);
     if (data == NULL) return NULL;
-    ret = fread(data, 1, sz, fp);
+    if (fread(data, 1, sz, fp) != sz) {
+        free(data);
+        return NULL;
+    }
     return data;
 }
 
@@ -105,8 +48,16 @@ static unsigned char *load_model(const char *filename, int *model_size)
         printf("Open file %s failed.\n", filename);
         return NULL;
     }
-    fseek(fp, 0, SEEK_END);
-    int size = ftell(fp);
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long length = ftell(fp);
+    if (length <= 0 || length > INT_MAX) {
+        fclose(fp);
+        return NULL;
+    }
+    int size = (int)length;
     data = load_data(fp, 0, size);
     fclose(fp);
     *model_size = size;
@@ -115,8 +66,8 @@ static unsigned char *load_model(const char *filename, int *model_size)
 
 void* init_yolo26_model(const char* model_path) {
     int ret;
-    RKNN_Context* ctx = (RKNN_Context*)malloc(sizeof(RKNN_Context));
-    memset(ctx, 0, sizeof(RKNN_Context));
+    RKNN_Context* ctx = (RKNN_Context*)calloc(1, sizeof(RKNN_Context));
+    if (ctx == NULL) return NULL;
 
     int model_data_size = 0;
     unsigned char* model_data = load_model(model_path, &model_data_size);
@@ -132,247 +83,154 @@ void* init_yolo26_model(const char* model_path) {
         free(ctx);
         return NULL;
     }
+    ctx->is_init = true;
 
     ret = rknn_query(ctx->ctx, RKNN_QUERY_IN_OUT_NUM, &ctx->io_num, sizeof(ctx->io_num));
-    if (ret < 0) {
-        free(ctx);
+    if (ret < 0 || ctx->io_num.n_input != 1 || ctx->io_num.n_output < 1 || ctx->io_num.n_output > 3) {
+        fprintf(stderr, "YOLO26 requires one input and one to three detection outputs.\n");
+        release_yolo26_model(ctx);
         return NULL;
     }
 
-    ctx->input_attrs = (rknn_tensor_attr*)malloc(sizeof(rknn_tensor_attr) * ctx->io_num.n_input);
-    ctx->output_attrs = (rknn_tensor_attr*)malloc(sizeof(rknn_tensor_attr) * ctx->io_num.n_output);
+    ctx->input_attrs = (rknn_tensor_attr*)calloc(ctx->io_num.n_input, sizeof(rknn_tensor_attr));
+    ctx->output_attrs = (rknn_tensor_attr*)calloc(ctx->io_num.n_output, sizeof(rknn_tensor_attr));
+    if (!ctx->input_attrs || !ctx->output_attrs) {
+        release_yolo26_model(ctx);
+        return NULL;
+    }
 
     for (int i = 0; i < ctx->io_num.n_input; i++) {
         ctx->input_attrs[i].index = i;
-        rknn_query(ctx->ctx, RKNN_QUERY_INPUT_ATTR, &(ctx->input_attrs[i]), sizeof(rknn_tensor_attr));
+        if (rknn_query(ctx->ctx, RKNN_QUERY_INPUT_ATTR, &(ctx->input_attrs[i]), sizeof(rknn_tensor_attr)) < 0) {
+            release_yolo26_model(ctx);
+            return NULL;
+        }
     }
     for (int i = 0; i < ctx->io_num.n_output; i++) {
         ctx->output_attrs[i].index = i;
-        rknn_query(ctx->ctx, RKNN_QUERY_OUTPUT_ATTR, &(ctx->output_attrs[i]), sizeof(rknn_tensor_attr));
+        if (rknn_query(ctx->ctx, RKNN_QUERY_OUTPUT_ATTR, &(ctx->output_attrs[i]), sizeof(rknn_tensor_attr)) < 0) {
+            release_yolo26_model(ctx);
+            return NULL;
+        }
     }
 
+    if (ctx->input_attrs[0].n_dims != 4) {
+        release_yolo26_model(ctx);
+        return NULL;
+    }
+    int channels;
     if (ctx->input_attrs[0].fmt == RKNN_TENSOR_NHWC) {
         ctx->model_width = ctx->input_attrs[0].dims[2];
         ctx->model_height = ctx->input_attrs[0].dims[1];
+        channels = ctx->input_attrs[0].dims[3];
     } else {
         ctx->model_width = ctx->input_attrs[0].dims[3];
         ctx->model_height = ctx->input_attrs[0].dims[2];
+        channels = ctx->input_attrs[0].dims[1];
     }
+    if (ctx->model_width != 640 || ctx->model_height != 640 || channels != 3) {
+        fprintf(stderr, "YOLO26 preprocessing requires a 640x640 RGB input.\n");
+        release_yolo26_model(ctx);
+        return NULL;
+    }
+    const rknn_tensor_attr* output = &ctx->output_attrs[0];
+    ctx->raw_outputs = output->n_dims == 4;
+    bool valid = true;
+    if (ctx->raw_outputs) {
+        int expected_channels = 0;
+        for (unsigned i = 0; i < ctx->io_num.n_output; ++i) {
+            const rknn_tensor_attr* attr = &ctx->output_attrs[i];
+            bool nhwc = attr->fmt == RKNN_TENSOR_NHWC;
+            unsigned c = attr->dims[nhwc ? 3 : 1];
+            unsigned h = attr->dims[nhwc ? 1 : 2];
+            unsigned w = attr->dims[nhwc ? 2 : 3];
+            if (i == 0) expected_channels = c;
+            if (attr->n_dims != 4 || attr->dims[0] != 1 ||
+                (attr->fmt != RKNN_TENSOR_NHWC && attr->fmt != RKNN_TENSOR_NCHW) ||
+                c <= 4 || c > 1024 || h == 0 || h > 640 || w == 0 || w > 640 ||
+                c != (unsigned)expected_channels || attr->n_elems != c * h * w) valid = false;
+        }
+    } else {
+        valid = ctx->io_num.n_output == 1 &&
+                ((output->n_dims == 2 && (output->dims[0] == 6 || output->dims[1] == 6)) ||
+                 (output->n_dims == 3 && output->dims[0] == 1 &&
+                  (output->dims[1] == 6 || output->dims[2] == 6)));
+    }
+    if (!valid) {
+        fprintf(stderr, "Unsupported YOLO26 output layout.\n");
+        release_yolo26_model(ctx);
+        return NULL;
+    }
+    printf("[Model] %s, outputs=%u, layout=%s\n", model_path,
+           ctx->io_num.n_output, ctx->raw_outputs ? "raw feature maps" : "end-to-end detections");
 
-    ctx->is_init = true;
     return (void*)ctx;
 }
 
 void release_yolo26_model(void* ctx_ptr) {
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
-    if (ctx && ctx->is_init) {
-        rknn_destroy(ctx->ctx);
+    if (ctx) {
+        if (ctx->is_init) rknn_destroy(ctx->ctx);
         if (ctx->input_attrs) free(ctx->input_attrs);
         if (ctx->output_attrs) free(ctx->output_attrs);
         free(ctx);
     }
 }
 
+void set_yolo26_scores_mode(void* ctx_ptr, int mode) {
+    RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
+    if (ctx && mode >= 0 && mode <= 2) ctx->scores_mode = mode;
+}
+
 int detect_yolo26(void* ctx_ptr, unsigned char* img_data, float conf_thres, Detection* results, int max_results) {
     RKNN_Context* ctx = (RKNN_Context*)ctx_ptr;
-    if (!ctx || !ctx->is_init) return 0;
-
-    int ret;
-    rknn_input inputs[1];
-    memset(inputs, 0, sizeof(inputs));
-    inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_UINT8;
-    inputs[0].size = ctx->model_width * ctx->model_height * 3;
-    inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].pass_through = 0;
-    inputs[0].buf = img_data;
-
-    ret = rknn_inputs_set(ctx->ctx, ctx->io_num.n_input, inputs);
-    if (ret < 0) return 0;
-
-    ret = rknn_run(ctx->ctx, NULL);
-    if (ret < 0) return 0;
+    if (!ctx || !ctx->is_init || !img_data || !results || max_results <= 0) return -1;
+    rknn_input input;
+    memset(&input, 0, sizeof(input));
+    input.type = RKNN_TENSOR_UINT8;
+    input.size = ctx->model_width * ctx->model_height * 3;
+    input.fmt = RKNN_TENSOR_NHWC;
+    input.buf = img_data;
+    if (rknn_inputs_set(ctx->ctx, 1, &input) < 0 || rknn_run(ctx->ctx, NULL) < 0) return -1;
 
     rknn_output outputs[3];
     memset(outputs, 0, sizeof(outputs));
-    for(int i=0; i<3; i++) outputs[i].want_float = 1;
-    
-    ret = rknn_outputs_get(ctx->ctx, ctx->io_num.n_output, outputs, NULL);
-    if (ret < 0) return 0;
-
-    int det_count = 0;
-
-    // Process each scale (Stride 8, 16, 32)
-    for (int i = 0; i < ctx->io_num.n_output && i < 3; i++) {
-        float* data = (float*)outputs[i].buf;
-        int h, w, c;
-         
-        // check attributes
-        if (ctx->output_attrs[i].fmt == RKNN_TENSOR_NHWC) {
-            h = ctx->output_attrs[i].dims[1];
-            w = ctx->output_attrs[i].dims[2];
-            c = ctx->output_attrs[i].dims[3];
-        } else { // NCHW
-            c = ctx->output_attrs[i].dims[1];
-            h = ctx->output_attrs[i].dims[2];
-            w = ctx->output_attrs[i].dims[3];
-        }
-
-        // Infer STRIDE
-        int stride = ctx->model_width / w; // e.g. 640/80 = 8
-
-        const float* current_anchors = NULL;
-        if (stride == 8)  { current_anchors = &anchors[0][0]; }
-        else if (stride == 16) { current_anchors = &anchors[1][0]; }
-        else if (stride == 32) { current_anchors = &anchors[2][0]; }
-
-        bool is_anchor_based = false;
-        int num_anchors = 1;
-        int dims_per_anchor = c; 
-        int num_classes = 0;
-
-        if (c == 6) {
-             // 4 box + 2 class ?
-             // Or 1 anchor * (4 + 1 + 1)?
-             // Given user code 'nc: 2' -> 4 + 2 is most likely.
-             is_anchor_based = false;
-             num_classes = 2;
-             dims_per_anchor = 6;
-             num_anchors = 1; 
-        } else if (c > 6) {
-             if (c % 3 == 0) {
-                 // Try 3 anchors assumption
-                 int d = c / 3;
-                 if (d >= 5) {
-                     is_anchor_based = true;
-                     num_anchors = 3;
-                     dims_per_anchor = d;
-                     num_classes = d - 5;
-                 }
-             }
-             if (num_classes == 0) {
-                 // Try 1 anchor / anchor-free
-                 is_anchor_based = false; // assume anchor-free 4+NC
-                 num_anchors = 1;
-                 dims_per_anchor = c;
-                 num_classes = c - 4; // no obj
-             }
-        } else {
-             continue; // < 6 unsupported
-        }
-
-        // Iterate grid
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                for (int a = 0; a < num_anchors; a++) {
-                    
-                    // Helper macro (only valid within this scope variables: ctx, offset, data, h, w, x, y, a, dims_per_anchor)
-                    #define GET_VAL(ch_idx) ( \
-                        (ctx->output_attrs[i].fmt == RKNN_TENSOR_NHWC) ? \
-                        (data[offset + (ch_idx)]) : \
-                        (data[(a * dims_per_anchor + (ch_idx)) * (h * w) + (y * w) + x]) \
-                    )
-
-                    int offset;
-                    // For NHWC:
-                    if (ctx->output_attrs[i].fmt == RKNN_TENSOR_NHWC) {
-                         offset = y * w * c + x * c + a * dims_per_anchor;
-                    } else {
-                         offset = 0; // handled by macro
-                    }
-
-                    float final_score = 0;
-                    int class_id = -1;
-
-                    if (is_anchor_based) {
-                        // Obj + Class
-                        float obj_conf = sigmoid(GET_VAL(4));
-                        if (obj_conf < conf_thres) continue;
-
-                        float max_class_score = 0;
-                        for (int cls = 0; cls < num_classes; cls++) {
-                            float s = sigmoid(GET_VAL(5 + cls));
-                            if (s > max_class_score) {
-                                max_class_score = s;
-                                class_id = cls;
-                            }
-                        }
-                        final_score = obj_conf * max_class_score;
-                    } else {
-                        // Anchor-Free: No Obj, Just Class (4 + NC)
-                        // Score = Max(Sigmoid(Class))
-                        float max_class_score = 0;
-                        for (int cls = 0; cls < num_classes; cls++) {
-                            float s = sigmoid(GET_VAL(4 + cls));
-                            if (s > max_class_score) {
-                                max_class_score = s;
-                                class_id = cls;
-                            }
-                        }
-                        final_score = max_class_score;
-                    }
-                    
-                    if (final_score < conf_thres) continue;
-
-                    // Box decoding
-                    float x1, y1, x2, y2;
-
-                    if (is_anchor_based) {
-                        // Standard YOLOv5/7
-                        float vx = sigmoid(GET_VAL(0));
-                        float vy = sigmoid(GET_VAL(1));
-                        float vw = sigmoid(GET_VAL(2));
-                        float vh = sigmoid(GET_VAL(3));
-
-                        float bx = (vx * 2.0f - 0.5f + x) * stride;
-                        float by = (vy * 2.0f - 0.5f + y) * stride;
-                        float aw = anchors[i][2*a]; // Use anchor logic
-                        float ah = anchors[i][2*a + 1];
-                        float bw = powf(vw * 2.0f, 2.0f) * aw;
-                        float bh = powf(vh * 2.0f, 2.0f) * ah;
-                        
-                        x1 = bx - bw * 0.5f;
-                        y1 = by - bh * 0.5f;
-                        x2 = bx + bw * 0.5f;
-                        y2 = by + bh * 0.5f;
-                    } else {
-                        // Anchor-Free (YOLOv8/10) - LTRB Assumption
-                        // values 0..3 are distances to l, t, r, b
-                        // Need to know distribution. 
-                        
-                        float d0 = GET_VAL(0);
-                        float d1 = GET_VAL(1);
-                        float d2 = GET_VAL(2);
-                        float d3 = GET_VAL(3);
-                        
-                        // Try DFL-style (but single value) -> Reg distances
-                        // x1 = (x + 0.5 - d0) * stride
-                        x1 = (x + 0.5f - d0) * stride;
-                        y1 = (y + 0.5f - d1) * stride;
-                        x2 = (x + 0.5f + d2) * stride;
-                        y2 = (y + 0.5f + d3) * stride;
-                    }
-
-                    if (det_count < max_results) {
-                        results[det_count].x1 = x1;
-                        results[det_count].y1 = y1;
-                        results[det_count].x2 = x2;
-                        results[det_count].y2 = y2;
-                        results[det_count].score = final_score;
-                        results[det_count].class_id = class_id;
-                        det_count++;
-                    }
-                    
-                    #undef GET_VAL
-                }
-            }
+    for (unsigned i = 0; i < ctx->io_num.n_output; ++i) {
+        outputs[i].index = i;
+        outputs[i].want_float = 1;
+    }
+    if (rknn_outputs_get(ctx->ctx, ctx->io_num.n_output, outputs, NULL) < 0) return -1;
+    for (unsigned i = 0; i < ctx->io_num.n_output; ++i) {
+        if (!outputs[i].buf || outputs[i].size < ctx->output_attrs[i].n_elems * sizeof(float)) {
+            rknn_outputs_release(ctx->ctx, ctx->io_num.n_output, outputs);
+            return -1;
         }
     }
-    
+    int count;
+    if (ctx->raw_outputs) {
+        Yolo26RawHead heads[3];
+        for (unsigned i = 0; i < ctx->io_num.n_output; ++i) {
+            const rknn_tensor_attr* attr = &ctx->output_attrs[i];
+            bool nhwc = attr->fmt == RKNN_TENSOR_NHWC;
+            heads[i].data = (const float*)outputs[i].buf;
+            heads[i].channels = attr->dims[nhwc ? 3 : 1];
+            heads[i].height = attr->dims[nhwc ? 1 : 2];
+            heads[i].width = attr->dims[nhwc ? 2 : 3];
+            heads[i].is_nhwc = nhwc;
+            heads[i].scores_mode = ctx->scores_mode;
+        }
+        count = yolo26_decode_raw_heads(heads, ctx->io_num.n_output,
+                                       ctx->model_width, ctx->model_height,
+                                       conf_thres, results, max_results);
+    } else {
+        const rknn_tensor_attr* attr = &ctx->output_attrs[0];
+        unsigned last = attr->n_dims - 1;
+        bool box_last = attr->dims[last] == 6;
+        int rows = box_last ? attr->dims[last - 1] : attr->dims[last];
+        count = yolo26_decode_detections((const float*)outputs[0].buf, rows, box_last,
+                                        ctx->model_width, ctx->model_height,
+                                        conf_thres, results, max_results);
+    }
     rknn_outputs_release(ctx->ctx, ctx->io_num.n_output, outputs);
-
-    // NMS Removed as requested for YOLO26
-    // nms_process(results, &det_count, nms_thres);
-
-    return det_count;
+    return count;
 }

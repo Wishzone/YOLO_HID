@@ -1,24 +1,46 @@
-CXX = g++
-CC = gcc
-CFLAGS = -O3 -fPIC -I/usr/include
-CXXFLAGS = -O3 -std=c++11 -I/usr/include `pkg-config --cflags opencv4`
-LDFLAGS = -lrknnrt -lm -lpthread -lrga `pkg-config --libs opencv4`
+CXX ?= g++
+CC ?= gcc
+PKG_CONFIG ?= pkg-config
+CPPFLAGS += -I/usr/include $(shell $(PKG_CONFIG) --cflags opencv4)
+CFLAGS ?= -O3 -fPIC
+CXXFLAGS ?= -O3 -std=c++11
+LDLIBS += -lrknnrt -lm -lpthread -lrga $(shell $(PKG_CONFIG) --libs opencv4)
 
-TARGET_APP_26 = ../yolo_app_26
+BUILD_DIR ?= ../build/obj
+TARGET_APP_26 ?= ../yolo_app_26
+C_SOURCES = models/yolo26_rknn.c models/yolo26_postprocess.c modules/v4l2_driver.c
+CXX_SOURCES = main_yolo26.cpp core/globals.cpp utils/sys_utils.cpp \
+	modules/hid_mouse.cpp modules/web_server.cpp modules/camera_capture.cpp
+OBJECTS = $(addprefix $(BUILD_DIR)/,$(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o))
+DEPS = $(OBJECTS:.o=.d)
 
-COMMON_OBJS = core/globals.o utils/sys_utils.o modules/hid_mouse.o modules/web_server.o modules/camera_capture.o modules/v4l2_driver.o
-OBJS_26 = models/yolo26_rknn.o main_yolo26.o $(COMMON_OBJS)
+.PHONY: all clean check-deps test
+all: check-deps $(TARGET_APP_26)
 
-all: $(TARGET_APP_26)
+check-deps:
+	@command -v $(CC) >/dev/null
+	@command -v $(CXX) >/dev/null
+	@$(PKG_CONFIG) --exists opencv4 || { echo 'Missing OpenCV development package (opencv4.pc)' >&2; exit 1; }
 
-$(TARGET_APP_26): $(OBJS_26)
-	$(CXX) -o $@ $(OBJS_26) $(LDFLAGS)
+$(TARGET_APP_26): $(OBJECTS)
+	$(CXX) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -f $(TARGET_APP_26) $(OBJS_26)
+	$(RM) $(OBJECTS) $(DEPS) $(TARGET_APP_26) ../build/test_postprocess
+
+../build/test_postprocess: ../tests/test_postprocess.c models/yolo26_postprocess.c models/yolo26_postprocess.h core/types.h
+	@mkdir -p ../build
+	$(CC) $(CFLAGS) -Wall -Wextra -Werror ../tests/test_postprocess.c models/yolo26_postprocess.c -lm -o $@
+
+test: ../build/test_postprocess
+	../build/test_postprocess
+
+-include $(DEPS)

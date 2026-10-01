@@ -1,2 +1,20 @@
-__pycache__
-Models/
+__pycache__/
+*.py[cod]
+
+# Models and generated EDID stay local to each board.
+/Models/
+
+# Build products are published as release assets, not source files.
+/build/
+/dist/
+*.o
+*.d
+/yolo_app
+/yolo_app_26
+
+# Local editor and runtime files.
+.vscode/
+.idea/
+*.log
+/core
+/core.[0-9]*

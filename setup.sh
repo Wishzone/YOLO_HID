@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# YOLO11n RK3588 Setup & Optimization Script
+# YOLO26 RK3588 Setup & Optimization Script
 # Run as root
 
 # 检查是否以 root 权限运行
@@ -10,6 +10,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 gadget=g1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- 1. Performance Settings ---
 setup_performance() {
@@ -61,7 +62,7 @@ setup_latency() {
         v4l2-ctl -d $VIDEO_DEV -c focus_auto=0 2>/dev/null
         
         # Load Custom EDID for 1080p Multi-Hz (240/180/165/60)
-        EDID_FILE="$(dirname $0)/Models/1080p_multi_hz.edid"
+        EDID_FILE="$SCRIPT_DIR/Models/1080p_multi_hz.edid"
         if [ -f "$EDID_FILE" ]; then
             v4l2-ctl -d $VIDEO_DEV --set-edid=file="$EDID_FILE",format=raw --fix-edid-checksums
         fi
