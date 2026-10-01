@@ -3,6 +3,8 @@
 #include <chrono>
 #include <iomanip>
 #include <string>
+#include <sstream>
+#include <algorithm>
 #include <signal.h>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/logger.hpp>
@@ -45,10 +47,14 @@ int main(int argc, char* argv[]) {
     std::string model_path = MODEL_PATH;
     bool check_model = false;
     int scores_mode = 0;
+    std::string hid_device = HID_DEVICE;
+    bool hid_enabled = true;
+    std::vector<int> target_classes{0};
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "--help" || argument == "-h") {
             std::cout << "Usage: " << argv[0] << " [--model PATH] [--scores auto|logits|probabilities] [--check-model]\n"
+                      << "  [--hid-device PATH] [--no-hid] [--start-paused] [--target-classes all|0,1,...]\n"
                       << "Default model: " << MODEL_PATH << "\n"
                       << "--check-model runs one NPU inference without camera, Web or HID.\n";
             return 0;
@@ -56,6 +62,27 @@ int main(int argc, char* argv[]) {
             model_path = argv[++i];
         } else if (argument == "--check-model") {
             check_model = true;
+        } else if (argument == "--no-hid") {
+            hid_enabled = false;
+        } else if (argument == "--start-paused") {
+            hid_control_enabled = false;
+        } else if (argument == "--hid-device" && i + 1 < argc) {
+            hid_device = argv[++i];
+        } else if (argument == "--target-classes" && i + 1 < argc) {
+            const std::string classes = argv[++i];
+            target_classes.clear();
+            if (classes != "all") {
+                std::istringstream input(classes);
+                std::string token;
+                while (std::getline(input, token, ',')) {
+                    if (token.empty() || token.find_first_not_of("0123456789") != std::string::npos) {
+                        std::cerr << "Invalid target classes: " << classes << std::endl; return 2;
+                    }
+                    try { target_classes.push_back(std::stoi(token)); }
+                    catch (...) { std::cerr << "Invalid target classes\n"; return 2; }
+                }
+                if (target_classes.empty() || classes.back() == ',') return 2;
+            }
         } else if (argument == "--scores" && i + 1 < argc) {
             const std::string mode = argv[++i];
             if (mode == "auto") scores_mode = 0;
@@ -67,6 +94,11 @@ int main(int argc, char* argv[]) {
             return 2;
         }
     }
+
+    std::cout << "[Control] Target classes:";
+    if (target_classes.empty()) std::cout << " all";
+    else for (int cls : target_classes) std::cout << ' ' << cls;
+    std::cout << std::endl;
 
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
     void* ctx = init_yolo26_model(model_path.c_str());
@@ -113,9 +145,11 @@ int main(int argc, char* argv[]) {
     set_affinity_big(); 
     set_realtime_priority();
     lock_memory();
-    hid_init(HID_DEVICE);
+    if (hid_enabled) hid_init(hid_device.c_str());
+    else std::cout << "[HID] Disabled by --no-hid" << std::endl;
     
-    std::thread hid_thread([](){ set_affinity_little(); hid_worker(HID_SMOOTH_FACTOR); });
+    std::thread hid_thread;
+    if (hid_enabled) hid_thread = std::thread([](){ set_affinity_little(); hid_worker(HID_SMOOTH_FACTOR); });
     std::thread web_thread([](){ web_worker(HTTP_PORT, MJPEG_QUALITY, AIM_HEIGHT_RATIO); });
     std::thread cleaner_thread([](){ // Background FD Scrubber
         set_affinity_little();
@@ -138,12 +172,12 @@ int main(int argc, char* argv[]) {
     int frame_count = 0;
     int exit_status = 0;
     
-    const float cx = 1920 / 2.0f;
-    const float cy = 1080 / 2.0f;
+    const float cx = camera_ctx.width / 2.0f;
+    const float cy = camera_ctx.height / 2.0f;
 
     // 预计算参数
-    float r = std::min(640.0f/1080.0f, 640.0f/1920.0f);
-    int nw = round(1920*r), nh = round(1080*r);
+    float r = std::min(640.0f/camera_ctx.height, 640.0f/camera_ctx.width);
+    int nw = round(camera_ctx.width*r), nh = round(camera_ctx.height*r);
     int dw = (640-nw)/2, dh = (640-nh)/2;
 
     while (running) {
@@ -169,20 +203,22 @@ int main(int argc, char* argv[]) {
         
         if (camera_ctx.format == V4L2_PIX_FMT_BGR24) {
             rga_buffer_t src_rga;
-            if (dma_fd >= 0) src_rga = wrapbuffer_fd(dma_fd, 1920, 1080, RK_FORMAT_BGR_888);
-            else src_rga = wrapbuffer_virtualaddr(raw_data, 1920, 1080, RK_FORMAT_BGR_888);
+            if (dma_fd >= 0) src_rga = wrapbuffer_fd(dma_fd, camera_ctx.width, camera_ctx.height, RK_FORMAT_BGR_888);
+            else src_rga = wrapbuffer_virtualaddr(raw_data, camera_ctx.width, camera_ctx.height, RK_FORMAT_BGR_888);
             
             void* dst_ptr = rgb_img.data + (dh * 640 + dw) * 3;
             rga_buffer_t dst_rga = wrapbuffer_virtualaddr(dst_ptr, nw, nh, RK_FORMAT_RGB_888); 
             dst_rga.wstride = 640; dst_rga.hstride = nh;
             
             if (imresize(src_rga, dst_rga) != IM_STATUS_SUCCESS) {
-                cv::Mat wrapper(1080, 1920, CV_8UC3, raw_data);
+                cv::Mat wrapper(camera_ctx.height, camera_ctx.width, CV_8UC3, raw_data, camera_ctx.bytes_per_line);
                 preprocess(wrapper, letterbox_img, r, dw, dh);
                 cv::cvtColor(letterbox_img, rgb_img, cv::COLOR_BGR2RGB);
             }
         } else {
-             cv::Mat wrapper(1080, 1920, CV_8UC3, raw_data); // Assumption: BGR24 or MJPG (but wrapped as raw)
+             cv::Mat encoded(1, camera_ctx.buffers[current_idx].bytes_used, CV_8UC1, raw_data);
+             cv::Mat wrapper = cv::imdecode(encoded, cv::IMREAD_COLOR);
+             if (wrapper.empty()) { v4l2_manual_qbuf(&camera_ctx, current_idx); continue; }
              preprocess(wrapper, letterbox_img, r, dw, dh);
              cv::cvtColor(letterbox_img, rgb_img, cv::COLOR_BGR2RGB);
         }
@@ -221,7 +257,8 @@ int main(int argc, char* argv[]) {
         float target_cx = 0, target_cy = 0;
         
         for(int i=0; i<count; i++) {
-            if (dets[i].class_id != 0) continue;
+            if (!target_classes.empty() && std::find(target_classes.begin(), target_classes.end(),
+                                                    dets[i].class_id) == target_classes.end()) continue;
 
             float x1 = (dets[i].x1 - dw)/r, y1 = (dets[i].y1 - dh)/r;
             float x2 = (dets[i].x2 - dw)/r, y2 = (dets[i].y2 - dh)/r;
@@ -231,7 +268,8 @@ int main(int argc, char* argv[]) {
             if (dist < min_dist) { min_dist = dist; target = &dets[i]; target_cx = tcx; target_cy = tcy; }
         }
 
-        if (target) {
+        hid_target_class = target ? target->class_id : -1;
+        if (target && hid_enabled && hid_control_enabled) {
             float raw_dx = target_cx - cx;
             float raw_dy = target_cy - cy;
             
@@ -272,31 +310,7 @@ int main(int argc, char* argv[]) {
         }
 
         // 5. Offload Buffer to Web Thread (If available)
-        bool buffer_offloaded = false;
-        
-        if (active_connections > 0) {
-             int expected = -1;
-             // Only try if web thread is asking/idle (idx == -1)
-             if (std::atomic_load(&web_transfer_buf_idx) == -1) {
-                // Populate params safely before swap
-                {
-                    std::lock_guard<std::mutex> lock(web_transfer_mutex);
-                    web_transfer_dets.assign(dets, dets + count);
-                }
-                web_transfer_r = r;
-                web_transfer_dw = dw;
-                web_transfer_dh = dh;
-                web_transfer_src_dma = dma_fd;
-                web_transfer_src_w = camera_ctx.width;
-                web_transfer_src_h = camera_ctx.height;
-                web_transfer_length = 0; // Not used for BGR24 path usually
-                web_transfer_data = raw_data;
-                
-                if (web_transfer_buf_idx.compare_exchange_strong(expected, current_idx)) {
-                    buffer_offloaded = true;
-                }
-             }
-        }
+        const bool buffer_offloaded = web_submit_frame(&camera_ctx, current_idx, dets, count, r, dw, dh);
         
         if (!buffer_offloaded) {
              v4l2_manual_qbuf(&camera_ctx, current_idx);

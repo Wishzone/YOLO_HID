@@ -34,13 +34,23 @@ $(BUILD_DIR)/%.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	$(RM) $(OBJECTS) $(DEPS) $(TARGET_APP_26) ../build/test_postprocess
+	$(RM) $(OBJECTS) $(DEPS) $(TARGET_APP_26) ../build/test_postprocess ../build/test_hid ../build/test_web
 
 ../build/test_postprocess: ../tests/test_postprocess.c models/yolo26_postprocess.c models/yolo26_postprocess.h core/types.h
 	@mkdir -p ../build
 	$(CC) $(CFLAGS) -Wall -Wextra -Werror ../tests/test_postprocess.c models/yolo26_postprocess.c -lm -o $@
 
-test: ../build/test_postprocess
+../build/test_hid: ../tests/test_hid.cpp modules/hid_mouse.cpp core/globals.cpp modules/hid_mouse.h core/globals.h
+	@mkdir -p ../build
+	$(CXX) $(CXXFLAGS) -Wall -Wextra -Werror ../tests/test_hid.cpp modules/hid_mouse.cpp core/globals.cpp -lpthread -Wl,--wrap=write -o $@
+
+../build/test_web: ../tests/test_web.cpp modules/web_server.cpp modules/hid_mouse.cpp core/globals.cpp utils/sys_utils.cpp $(BUILD_DIR)/modules/v4l2_driver.o modules/web_server.h modules/v4l2_driver.h modules/hid_mouse.h core/globals.h core/types.h utils/sys_utils.h
+	@mkdir -p ../build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -Wall -Wextra -Werror ../tests/test_web.cpp modules/web_server.cpp modules/hid_mouse.cpp core/globals.cpp utils/sys_utils.cpp $(BUILD_DIR)/modules/v4l2_driver.o -lrga -lpthread $(shell $(PKG_CONFIG) --libs opencv4) -Wl,--wrap=v4l2_manual_qbuf -o $@
+
+test: ../build/test_postprocess ../build/test_hid ../build/test_web
 	../build/test_postprocess
+	../build/test_hid
+	../build/test_web
 
 -include $(DEPS)

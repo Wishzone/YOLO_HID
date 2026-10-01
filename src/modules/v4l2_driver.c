@@ -73,10 +73,12 @@ int v4l2_open(v4l2_context_t* ctx, const char* dev_path, int width, int height, 
         ctx->width = fmt.fmt.pix_mp.width;
         ctx->height = fmt.fmt.pix_mp.height;
         ctx->format = fmt.fmt.pix_mp.pixelformat;
+        ctx->bytes_per_line = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
     } else {
         ctx->width = fmt.fmt.pix.width;
         ctx->height = fmt.fmt.pix.height;
         ctx->format = fmt.fmt.pix.pixelformat;
+        ctx->bytes_per_line = fmt.fmt.pix.bytesperline;
     }
     
     fprintf(stderr, "[V4L2] Fmt: %c%c%c%c %dx%d\n",
@@ -201,6 +203,7 @@ void v4l2_close(v4l2_context_t* ctx) {
 }
 
 int v4l2_manual_dqbuf(v4l2_context_t* ctx, struct v4l2_buffer* buf) {
+    struct v4l2_plane* caller_planes = ctx->is_mplane ? buf->m.planes : NULL;
     memset(buf, 0, sizeof(*buf));
     // Caller must provide buf->m.planes if MPLANE
     
@@ -215,11 +218,15 @@ int v4l2_manual_dqbuf(v4l2_context_t* ctx, struct v4l2_buffer* buf) {
     buf->type = ctx->type;
     buf->memory = V4L2_MEMORY_MMAP;
     if(ctx->is_mplane && buf->m.planes == NULL) {
-         buf->m.planes = planes;
+         buf->m.planes = caller_planes ? caller_planes : planes;
          buf->length = 8;
+         memset(buf->m.planes, 0, sizeof(planes));
     }
 
     if (ioctl(ctx->fd, VIDIOC_DQBUF, buf) == -1) return -1;
+    if (buf->index >= ctx->n_buffers) return -1;
+    ctx->buffers[buf->index].bytes_used = ctx->is_mplane ? buf->m.planes[0].bytesused : buf->bytesused;
+    if (ctx->is_mplane && !caller_planes) buf->m.planes = NULL;
     return 0;
 }
 

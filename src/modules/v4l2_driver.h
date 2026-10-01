@@ -12,6 +12,7 @@ extern "C" {
 typedef struct {
     void* start;
     size_t length;
+    size_t bytes_used;
     int dma_fd;
 } v4l2_buffer_mapping_t;
 
@@ -20,6 +21,7 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t format; 
+    uint32_t bytes_per_line;
     v4l2_buffer_mapping_t* buffers;
     unsigned int n_buffers;
     

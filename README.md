@@ -64,7 +64,20 @@ sudo bash ./setup.sh start
 sudo ./yolo_app_26 --model Models/cs2-26n_rk3588_int8.rknn --scores logits
 ```
 
-浏览器访问 `http://<板卡IP>:8080/` 可查看图像，MJPEG 地址为 `/stream`。使用 Ctrl+C 退出。停止 USB Gadget：
+浏览器访问 `http://<板卡IP>:8080/` 可查看所有类别的检测框、类别编号和置信度；页面顶部显示 USB 连接状态、检测数量、HID 成功发送和失败次数。可用页面按钮启用／暂停 HID，暂停时释放按钮并丢弃待发送移动。MJPEG 地址为 `/stream`，带框截图为 `/snapshot.jpg`，状态 JSON 为 `/status`。
+
+Web 显示所有类别，HID 默认仍控制类别 0。可按训练标签指定目标类别；类别编号必须来自自己的模型，不能照搬其他模型的头部／身体顺序：
+
+```bash
+sudo ./yolo_app_26 --scores logits --target-classes 0,2
+sudo ./yolo_app_26 --scores logits --target-classes all
+sudo ./yolo_app_26 --scores logits --target-classes 2,3 --start-paused # 从 Web 启用 HID
+sudo ./yolo_app_26 --scores logits --no-hid    # 仅检测和 Web 预览
+```
+
+HID 设备可通过 `--hid-device /dev/hidg1` 指定。USB OTG 数据接口必须连接被控制电脑，`USB configured` 表示已枚举；`not attached` 表示尚未建立连接。HID 写入失败会重试，程序正常退出时发送释放按钮的报表。`make test` 使用模拟接口验证 HID，不会操作实际鼠标。
+
+使用 Ctrl+C 退出。停止 USB Gadget：
 
 ```bash
 sudo bash ./setup.sh stop

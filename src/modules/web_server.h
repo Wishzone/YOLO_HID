@@ -19,16 +19,10 @@ struct WebData {
 extern WebData web_data_buffer;
 extern std::mutex web_mutex;
 
-extern std::atomic<int> web_transfer_buf_idx;
-extern std::mutex web_transfer_mutex;
-extern std::vector<Detection> web_transfer_dets;
-extern float web_transfer_r; 
-extern int web_transfer_dw, web_transfer_dh;
-extern int web_transfer_src_dma;
-extern int web_transfer_src_w, web_transfer_src_h;
-extern int web_transfer_length;
-extern void* web_transfer_data;
-
+bool web_submit_frame(v4l2_context_t* ctx, int index, const Detection* dets,
+                      int count, float r, int dw, int dh);
+int draw_detection_overlay(cv::Mat& frame, const std::vector<Detection>& detections,
+                           float r, int dw, int dh, float aim_height_ratio);
 void web_processor_func(v4l2_context_t* v4l2_ctx);
 void web_worker(int port, int mjpeg_quality, float aim_height_ratio);
 
