@@ -24,6 +24,15 @@ int main() {
     assert(image.at<cv::Vec3b>(240,600) != cv::Vec3b(0,0,0));
     assert(draw_detection_overlay(image,{{0,0,0,0,1,0}},1,0,0,0.2f) == 0);
     assert(draw_detection_overlay(image,detections,0,0,0,0.2f) == 0);
+    AimTarget selected; selected.visible=true; selected.id=42; selected.class_id=3; selected.x=960; selected.y=540;
+    cv::Mat marker(1080,1920,CV_8UC3,cv::Scalar(0,0,0));
+    draw_target_overlay(marker,selected,150);
+    assert(marker.at<cv::Vec3b>(540,960) != cv::Vec3b(0,0,0));
+    selected.visible=false;
+    cv::Mat lost(1080,1920,CV_8UC3,cv::Scalar(0,0,0));
+    draw_target_overlay(lost,selected,0);
+    assert(cv::countNonZero(lost.reshape(1)) == 0);
+    selected.visible=true;
     cv::Mat raw(64,64,CV_8UC3,cv::Scalar(20,40,60));
     v4l2_buffer_mapping_t buffer{};
     buffer.start = raw.data; buffer.length = raw.total()*3; buffer.bytes_used = buffer.length; buffer.dma_fd = -1;
@@ -31,7 +40,7 @@ int main() {
     ctx.width = 64; ctx.height = 64; ctx.format = V4L2_PIX_FMT_BGR24;
     ctx.bytes_per_line = 64*3; ctx.buffers = &buffer; ctx.n_buffers = 1;
     active_connections = 1;
-    assert(web_submit_frame(&ctx,0,detections.data(),detections.size(),1,0,0));
+    assert(web_submit_frame(&ctx,0,detections.data(),detections.size(),1,0,0,selected,150));
     std::thread processor([&] { web_processor_func(&ctx); });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!returning_buffer && std::chrono::steady_clock::now() < deadline)
@@ -47,6 +56,7 @@ int main() {
         std::lock_guard<std::mutex> lock(web_mutex);
         assert(web_data_buffer.valid && web_data_buffer.dets[0].class_id == 2);
         assert(web_data_buffer.r == 1 && web_data_buffer.dw == 0);
+        assert(web_data_buffer.target.id == 42 && web_data_buffer.target.visible && web_data_buffer.aim_radius == 150);
         assert(web_data_buffer.img.at<cv::Vec3b>(0,0) == cv::Vec3b(20,40,60));
     }
     running = false;

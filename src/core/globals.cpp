@@ -5,6 +5,9 @@ std::atomic<bool> fire_request(false);
 std::atomic<int> active_connections(0);
 std::atomic<int> hid_target_class(-1);
 std::atomic<bool> hid_control_enabled(true);
+std::atomic<int> aim_mode(0);
+std::atomic<bool> aim_head_classes_available(false);
+std::atomic<uint64_t> aim_settings_revision(0);
 
 float hid_buffer_x = 0.0f;
 float hid_buffer_y = 0.0f;

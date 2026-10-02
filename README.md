@@ -11,7 +11,7 @@ src/modules/    V4L2、图像采集、USB HID 和 Web 预览
 src/utils/      图像预处理及调度辅助函数
 tools/         模型检查和 EDID 生成工具
 scripts/       发布包生成脚本
-tests/         后处理、HID、Web 预览及 EDID 回归测试
+tests/         后处理、目标跟踪、HID、Web 预览及 EDID 回归测试
 Models/        本机模型及 EDID（不纳入 Git 和发布包）
 build/obj/     编译中间文件及头文件依赖（自动生成）
 dist/          发布包与 SHA-256 校验文件（自动生成）
@@ -78,6 +78,24 @@ sudo ./yolo_app_26 --scores logits --no-hid    # 仅检测和 Web 预览
 ```
 
 HID 设备可通过 `--hid-device /dev/hidg1` 指定。USB OTG 数据接口必须连接被控制电脑，`USB configured` 表示已枚举；`not attached` 表示尚未建立连接。HID 写入失败会重试，程序正常退出时发送释放按钮的报表。`make test` 使用模拟接口验证 HID，不会操作实际鼠标。
+
+## 目标跟踪与选择
+
+参考 `mydet.py` 的跨帧关联、目标锁定、头部选择和运动预测思路，新增适配当前 C++/RKNN 工程的几何跟踪器。检测结果仍先执行类别 NMS，再逐一匹配同类别框；每个旧目标在一帧中最多匹配一次，避免多个候选覆盖同一个目标。锁定选择带切换冷却和距离差阈值，减少相近目标之间的反复跳转。短暂漏检保留编号 120ms，但停止 HID 移动和点击；重新出现或切换目标时清空旧移动缓存并重置 PID 差分。
+
+默认仍选择靠近画面中心的目标。头部类别需通过 `--head-classes` 显式指定，程序不假设奇数类别就是头部。配置后可在网页顶部切换“中心最近”“头部优先”“仅头部”“仅身体”；头部瞄准框中心，身体保持框高度 20% 的原有位置。画面黄色 `LOCK #编号` 十字表示当前选择，暂停 HID 时仍可预览。
+
+本板 CS2 实测类别 2 为身体、类别 3 为头部，可使用：
+
+```bash
+sudo ./yolo_app_26 --scores logits --target-classes 2,3 --head-classes 3 --aim-mode head-priority --start-paused
+```
+
+其他模型应按自己的训练标签修改类别列表。`body-only` 表示目标类别列表中不属于 `--head-classes` 的类别。头部优先会对头部给予距离评分加成，仍允许显著靠近中心的身体目标被选中；不是把所有头部强行排在身体前。
+
+可选参数：`--aim-radius 200` 将选择限制在原始 HDMI 画面中心 200 像素半径内，并画出范围圈（默认 0，即全画面）；这是选择范围，不裁剪模型输入。`--prediction-ms 20` 开启速度平滑后的提前量，允许 0–40ms，位移限制为框对角线的 25% 且最多 20 像素，漏检、方向反转或长时间停顿会重置／减弱预测；默认关闭。`--hid-smoothing 0.5` 可调节现有 HID 输出平滑（0.01–1，默认 1；数值较小更平缓、延迟也更高）。坐标始终使用真实输入尺寸和 letterbox 逆变换，不复制参考脚本的固定 416 尺寸、Windows 截屏或 CUDA 推理路径。
+
+跟踪仅依据位置、框重叠和类别，不具备身份识别能力，目标重叠、快速穿越或长时间遮挡时可能重新分配编号。`/status` 增加 `aim_mode`、`target_id`、`target_visible`、`head_modes_available`、`aim_radius`；`POST /aim/nearest`、`/aim/head-priority`、`/aim/head-only`、`/aim/body-only` 用于切换模式，缺少头部类别配置时后三项返回 400。
 
 使用 Ctrl+C 退出。停止 USB Gadget：
 

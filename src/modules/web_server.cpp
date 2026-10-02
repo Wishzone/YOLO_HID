@@ -27,13 +27,15 @@ struct WebTransfer {
     std::vector<Detection> detections;
     float r = 1;
     int dw = 0, dh = 0;
+    AimTarget target;
+    float aim_radius = 0;
 };
 static WebTransfer transfer;
 static std::mutex transfer_mutex;
 static std::condition_variable transfer_cv;
 
 bool web_submit_frame(v4l2_context_t* ctx, int index, const Detection* dets,
-                      int count, float r, int dw, int dh) {
+                      int count, float r, int dw, int dh, const AimTarget& target, float aim_radius) {
     if (active_connections <= 0 || index < 0 ||
         static_cast<unsigned>(index) >= ctx->n_buffers) return false;
     std::lock_guard<std::mutex> lock(transfer_mutex);
@@ -42,6 +44,7 @@ bool web_submit_frame(v4l2_context_t* ctx, int index, const Detection* dets,
     transfer.index = index;
     transfer.detections.assign(dets, dets + count);
     transfer.r = r; transfer.dw = dw; transfer.dh = dh;
+    transfer.target = target; transfer.aim_radius = aim_radius;
     transfer_cv.notify_one();
     return true;
 }
@@ -90,6 +93,8 @@ void web_processor_func(v4l2_context_t* ctx) {
             web_data_buffer.r = frame.r;
             web_data_buffer.dw = frame.dw;
             web_data_buffer.dh = frame.dh;
+            web_data_buffer.target = frame.target;
+            web_data_buffer.aim_radius = frame.aim_radius;
             web_data_buffer.valid = true;
             ++web_data_buffer.frame_id;
         }
@@ -101,9 +106,10 @@ void web_processor_func(v4l2_context_t* ctx) {
 }
 
 int draw_detection_overlay(cv::Mat& image, const std::vector<Detection>& detections,
-                           float r, int dw, int dh, float aim_height_ratio) {
+                           float r, int dw, int dh, float /* aim_height_ratio */) {
     if (image.empty() || !std::isfinite(r) || r <= 0) return 0;
     const cv::Scalar colors[] = {{0,255,0}, {0,210,255}, {255,160,0}, {255,0,220}};
+    std::vector<cv::Rect> labels;
     int drawn = 0;
     for (const auto& det : detections) {
         if (!std::isfinite(det.x1) || !std::isfinite(det.y1) ||
@@ -117,13 +123,42 @@ int draw_detection_overlay(cv::Mat& image, const std::vector<Detection>& detecti
         cv::rectangle(image, {x1,y1}, {x2,y2}, color, 3);
         std::ostringstream label;
         label << "class " << det.class_id << "  " << std::fixed << std::setprecision(0) << det.score*100 << '%';
-        const cv::Point text(x1, std::max(22, y1 - 8));
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(label.str(),cv::FONT_HERSHEY_SIMPLEX,0.65,2,&baseline);
+        cv::Point text(std::min(x1,std::max(0,image.cols-text_size.width-4)),std::max(22,y1-8));
+        const int preferred = text.y;
+        const int step = text_size.height+baseline+8;
+        const int upper_rows = (preferred-22)/step;
+        cv::Rect bounds;
+        for (size_t attempt=0; attempt<=labels.size(); ++attempt) {
+            text.y = attempt <= static_cast<size_t>(upper_rows) ? preferred-int(attempt)*step :
+                     std::min(image.rows-baseline-4,preferred+(int(attempt)-upper_rows)*step);
+            bounds = cv::Rect(text.x,text.y-text_size.height-3,text_size.width+4,text_size.height+baseline+6);
+            if (std::none_of(labels.begin(),labels.end(),[&](const cv::Rect& other) {
+                return (bounds & other).area() > 0;
+            })) break;
+        }
+        labels.push_back(bounds);
         cv::putText(image, label.str(), text, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0,0,0}, 4);
         cv::putText(image, label.str(), text, cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2);
-        cv::circle(image, {(x1+x2)/2, cvRound(y1+(y2-y1)*aim_height_ratio)}, 4, {0,0,255}, -1);
         ++drawn;
     }
     return drawn;
+}
+
+void draw_target_overlay(cv::Mat& image, const AimTarget& target, float aim_radius) {
+    if (image.empty()) return;
+    if (std::isfinite(aim_radius) && aim_radius > 0)
+        cv::circle(image,{image.cols/2,image.rows/2},cvRound(std::min(aim_radius,100000.0f)),{100,100,100},1);
+    if (!target.visible || !std::isfinite(target.x) || !std::isfinite(target.y)) return;
+    const cv::Point point(cvRound(std::max(0.0f,std::min(float(image.cols-1),target.x))),
+                          cvRound(std::max(0.0f,std::min(float(image.rows-1),target.y))));
+    cv::circle(image,point,9,{0,230,255},2);
+    cv::drawMarker(image,point,{0,230,255},cv::MARKER_CROSS,12,2);
+    const cv::Point text(std::max(0,std::min(image.cols-1,point.x+14)),std::max(22,point.y-12));
+    const std::string label = "LOCK #"+std::to_string(target.id);
+    cv::putText(image,label,text,cv::FONT_HERSHEY_SIMPLEX,0.6,{0,0,0},4);
+    cv::putText(image,label,text,cv::FONT_HERSHEY_SIMPLEX,0.6,{0,230,255},2);
 }
 
 static bool send_all(int fd, const void* data, size_t size) {
@@ -137,8 +172,8 @@ static bool send_all(int fd, const void* data, size_t size) {
     return true;
 }
 
-static void respond(int fd, const char* content_type, const std::string& body) {
-    const std::string header = std::string("HTTP/1.1 200 OK\r\nContent-Type: ") + content_type +
+static void respond(int fd, const char* content_type, const std::string& body, bool ok = true) {
+    const std::string header = std::string(ok ? "HTTP/1.1 200 OK\r\nContent-Type: " : "HTTP/1.1 400 Bad Request\r\nContent-Type: ") + content_type +
         "\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     if (send_all(fd, header.data(), header.size())) send_all(fd, body.data(), body.size());
 }
@@ -157,19 +192,42 @@ static void handle_client(int socket, int quality, float aim_height_ratio) {
             hid_control_enabled = first_line.find("POST /hid/resume ") == 0;
             hid_buffer_x = hid_buffer_y = 0;
             fire_request = false;
+            ++aim_settings_revision;
         }
         hid_cv.notify_all();
         respond(socket, "application/json", "{\"ok\":true}");
+    } else if (first_line.find("POST /aim/") == 0) {
+        const size_t end = first_line.find(' ',10);
+        const std::string name = first_line.substr(10,end == std::string::npos ? end : end-10);
+        AimMode mode;
+        if (!parse_aim_mode(name.c_str(),mode) ||
+            (mode != AimMode::Nearest && !aim_head_classes_available.load())) {
+            respond(socket,"application/json","{\"ok\":false,\"error\":\"Mode requires configured model head classes\"}",false);
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(hid_mutex);
+                aim_mode = static_cast<int>(mode);
+                ++aim_settings_revision;
+                hid_buffer_x = hid_buffer_y = 0; fire_request = false;
+            }
+            hid_cv.notify_all();
+            respond(socket,"application/json","{\"ok\":true}");
+        }
     } else if (first_line.find("GET /status ") == 0) {
         const auto hid = hid_get_status();
         std::ostringstream json;
         json << "{\"usb_state\":\"" << hid_usb_state() << "\",\"hid_open\":" << (hid.opened ? "true" : "false")
              << ",\"hid_reports\":" << hid.reports << ",\"hid_errors\":" << hid.errors
-             << ",\"target_class\":" << hid_target_class.load()
+             << ",\"aim_mode\":\"" << aim_mode_name(static_cast<AimMode>(aim_mode.load())) << "\""
+             << ",\"head_modes_available\":" << (aim_head_classes_available.load() ? "true" : "false")
              << ",\"hid_enabled\":" << (hid_control_enabled.load() ? "true" : "false");
         {
             std::lock_guard<std::mutex> lock(web_mutex);
             json << ",\"frame_id\":" << web_data_buffer.frame_id
+                 << ",\"target_class\":" << (web_data_buffer.target.visible ? web_data_buffer.target.class_id : -1)
+                 << ",\"target_id\":" << web_data_buffer.target.id
+                 << ",\"target_visible\":" << (web_data_buffer.target.visible ? "true" : "false")
+                 << ",\"aim_radius\":" << web_data_buffer.aim_radius
                  << ",\"detections\":" << web_data_buffer.dets.size() << ",\"classes\":[";
             for (size_t i=0; i<web_data_buffer.dets.size(); ++i) {
                 if (i) json << ',';
@@ -192,12 +250,15 @@ static void handle_client(int socket, int quality, float aim_height_ratio) {
             cv::Mat image;
             std::vector<Detection> detections;
             float r = 1; int dw = 0, dh = 0;
+            AimTarget target;
+            float aim_radius = 0;
             {
                 std::lock_guard<std::mutex> lock(web_mutex);
                 if (web_data_buffer.valid && web_data_buffer.frame_id > last_frame_id) {
                     image = web_data_buffer.img.clone();
                     detections = web_data_buffer.dets;
                     r = web_data_buffer.r; dw = web_data_buffer.dw; dh = web_data_buffer.dh;
+                    target = web_data_buffer.target; aim_radius = web_data_buffer.aim_radius;
                     last_frame_id = web_data_buffer.frame_id;
                 }
             }
@@ -207,6 +268,7 @@ static void handle_client(int socket, int quality, float aim_height_ratio) {
                 continue;
             }
             draw_detection_overlay(image, detections, r, dw, dh, aim_height_ratio);
+            draw_target_overlay(image,target,aim_radius);
             std::vector<uchar> jpeg;
             if (!cv::imencode(".jpg", image, jpeg, {cv::IMWRITE_JPEG_QUALITY, quality})) continue;
             if (snapshot) {
@@ -222,7 +284,7 @@ static void handle_client(int socket, int quality, float aim_height_ratio) {
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YOLO 检测预览</title>
 <style>body{margin:0;background:#111;color:#eee;font:14px sans-serif}header{padding:12px;background:#222;display:flex;gap:16px;align-items:center;flex-wrap:wrap}button{padding:8px 16px;cursor:pointer}main{display:flex;justify-content:center}img{max-width:100%;max-height:calc(100vh - 90px)}</style>
-<header><button id="hid" disabled>读取 HID 状态</button><span id="status">正在连接…</span></header>
+<header><button id="hid" disabled>读取 HID 状态</button><label>目标选择 <select id="mode" disabled><option value="nearest">中心最近</option><option value="head-priority">头部优先</option><option value="head-only">仅头部</option><option value="body-only">仅身体</option></select></label><span id="status">正在连接…</span></header>
 <main><img src="/stream" alt="HDMI 检测画面"></main>
 <script>
 let enabled=false;
@@ -232,10 +294,13 @@ async function update(){
   const c=[...new Set(s.classes)].join(', ')||'无';
   const button=document.getElementById('hid'); button.disabled=!s.hid_open;
   button.textContent=!s.hid_open?'HID 未打开':enabled?'暂停 HID 鼠标':'启用 HID 鼠标';
-  document.getElementById('status').textContent=`检测框 ${s.detections} | 类别 ${c} | 控制目标 ${s.target_class<0?'未选中':'类别 '+s.target_class} | USB ${s.usb_state} | HID ${enabled?'运行':'暂停'} | 已发送 ${s.hid_reports} | 写入失败 ${s.hid_errors}`;
+  const mode=document.getElementById('mode');mode.disabled=false;mode.value=s.aim_mode;
+  for(const option of mode.options)option.disabled=option.value!=='nearest'&&!s.head_modes_available;
+  document.getElementById('status').textContent=`检测框 ${s.detections} | 类别 ${c} | 选中 ${s.target_visible?'#'+s.target_id+' 类别 '+s.target_class:s.target_id?'#'+s.target_id+' 等待重现':'无'} | USB ${s.usb_state} | HID ${enabled?'运行':'暂停'} | 已发送 ${s.hid_reports} | 写入失败 ${s.hid_errors}`;
  }catch(e){document.getElementById('status').textContent='状态连接中断，请刷新页面';}
 }
 document.getElementById('hid').onclick=async()=>{await fetch(enabled?'/hid/pause':'/hid/resume',{method:'POST'});await update();};
+document.getElementById('mode').onchange=async event=>{const response=await fetch('/aim/'+event.target.value,{method:'POST'});if(!response.ok)alert('请先配置模型的头部类别');await update();};
 update();setInterval(update,1000);
 </script></html>)HTML");
     }
