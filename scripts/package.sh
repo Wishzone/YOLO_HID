@@ -19,6 +19,7 @@ trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/$name/src" "$stage/$name/tools" "$stage/$name/scripts" "$stage/$name/tests" "$stage/$name/Models"
 install -m 755 yolo_app_26 setup.sh "$stage/$name/"
 cp Makefile README.md .gitignore "$stage/$name/"
+cp -R docs "$stage/$name/"
 while IFS= read -r -d '' source; do
     mkdir -p "$stage/$name/$(dirname "$source")"
     cp "$source" "$stage/$name/$source"
