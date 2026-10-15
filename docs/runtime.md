@@ -62,6 +62,8 @@ sudo ./yolo_app_26 --scores logits --target-classes 2,3 --head-classes 3 --aim-m
 
 可选参数：`--aim-radius 200` 将选择限制在原始 HDMI 画面中心 200 像素半径内，并画出范围圈（默认 0，即全画面）；这是选择范围，不裁剪模型输入。`--prediction-ms 20` 开启速度平滑后的提前量，允许 0–40ms，位移限制为框对角线的 25% 且最多 20 像素，漏检、方向反转或长时间停顿会重置／减弱预测；默认关闭。`--hid-smoothing 0.5` 可调节现有 HID 输出平滑（0.01–1，默认 1；数值较小更平缓、延迟也更高）。坐标始终使用真实输入尺寸和 letterbox 逆变换，不复制参考脚本的固定 416 尺寸、Windows 截屏或 CUDA 推理路径。
 
+控制参数可通过 `--kp 0.6`、`--kd 0.35`、`--sensitivity 0.5`、`--deadzone 0` 和 `--aim-ratio 0.2` 设置，默认保持原有算法。Kp、Kd 范围为 0–5，鼠标倍率为 0.001–10，死区为 0–100 源像素，身体瞄准高度比例为 0–1。控制器为逐检测帧 PD，没有积分项或时间归一化。可先使用[离线仿真工具](simulation.md)调节参数、查看入框帧数和预测对照，再复制参数用于实机。
+
 跟踪仅依据位置、框重叠和类别，不具备身份识别能力，目标重叠、快速穿越或长时间遮挡时可能重新分配编号。`/status` 增加 `aim_mode`、`target_id`、`target_visible`、`head_modes_available`、`aim_radius`；`POST /aim/nearest`、`/aim/head-priority`、`/aim/head-only`、`/aim/body-only` 用于切换模式，缺少头部类别配置时后三项返回 400。
 
 使用 Ctrl+C 退出。停止 USB Gadget：

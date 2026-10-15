@@ -14,6 +14,9 @@
 | `src/modules/v4l2_driver.*` | V4L2 设备、缓冲区、采集队列和 HDMI fence 管理 |
 | `src/modules/camera_capture.*` | 视频采集线程与最新帧交接 |
 | `src/modules/target_tracker.*` | 跨帧关联、目标锁定、瞄准模式及有限运动预测 |
+| `src/modules/aim_controller.*` | 实机与仿真共用的逐帧 PD、死区、倍率及点击判定 |
+| `src/modules/aim_simulation.*` | 固定准星闭环仿真、延迟和 HID 时序模型及入框统计 |
+| `src/modules/hid_motion.h` | 实机与仿真共用的 HID 整数拆分、平滑和限幅 |
 | `src/modules/hid_mouse.*` | USB HID 报表、移动拆分、失败重试及按键释放 |
 | `src/modules/web_server.*` | 画面拷贝、检测与目标叠加、MJPEG、状态和控制接口 |
 | `src/utils/sys_utils.*` | 图像预处理、CPU 亲和性、调度与内存设置 |
@@ -29,11 +32,14 @@
 | `setup.sh` | 性能设置、USB Gadget、EDID 加载与读回检查 |
 | `tools/check_model.py` | 可选 Python 模型检查工具，所需依赖取决于模型格式 |
 | `tools/gen_edid.py` | EDID 生成与结构、校验和检查 |
+| `tools/aim_simulator.cpp` | 不依赖设备库的离线仿真命令行及 JSON／CSV 导出 |
+| `tools/aim_simulator.py` / `tools/aim_simulator.html` | 本地仿真服务与可视化调参、回放界面 |
 | `tests/test_postprocess.c` | 输出解析与 NMS 回归测试 |
 | `tests/test_tracker.cpp` | 目标关联、模式切换、坐标还原与预测测试 |
 | `tests/test_hid.cpp` | 模拟 HID 写入、拆分、重试、暂停及退出测试 |
 | `tests/test_web.cpp` | 检测叠加、坐标、图像拷贝及帧所有权测试 |
 | `tests/test_edid.py` | EDID 时序、布局和校验测试 |
+| `tests/test_simulation.cpp` / `tests/test_simulator_api.py` | PD 与 HID 反馈、仿真指标、参数校验及 HTTP 导出测试 |
 | `scripts/package.sh` | 生成含源码、程序和文档的发布包与 SHA-256 校验文件 |
 | `docs/` | 项目结构、构建发布、运行和 HDMI 配置说明 |
 

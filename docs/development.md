@@ -24,7 +24,7 @@ make -j4
 
 ## 测试
 
-`make test` 运行后处理、HID、Web 预览、目标跟踪四组 C/C++ 测试，以及四个 EDID 单元测试。HID 使用模拟写入，Web 使用测试图像；不会启动采集或发送实际鼠标报表。测试可执行文件位于 `build/`。
+`make test` 运行后处理、HID、Web 预览、目标跟踪、闭环仿真五组 C/C++ 测试，以及 EDID 和仿真接口的 Python 测试。HID 使用模拟写入，Web 使用测试图像，仿真接口使用本地临时端口；不会启动采集或发送实际鼠标报表。测试可执行文件位于 `build/`。
 
 如果当前 Python 来自 Anaconda，可以显式使用系统 Python：
 
@@ -33,6 +33,8 @@ make test PYTHON=/usr/bin/python3
 ```
 
 `make clean` 清理对象文件、依赖文件、测试程序和应用程序；本机模型与 `dist/` 发布包保留。
+
+离线仿真只需 C++11 编译器、Make 和 Python 3 标准库：`make simulate` 启动调参界面，`make build/aim_simulator` 仅编译命令行工具，不需要 OpenCV、RKNN 或 RGA。参数与标定步骤见[仿真文档](simulation.md)。
 
 ## 发布包
 

@@ -7,6 +7,7 @@
 - [项目结构与模块职责](docs/structure.md)
 - [构建、测试与发布](docs/development.md)
 - [模型验证、运行参数与目标跟踪](docs/runtime.md)
+- [HID 与预判调参仿真](docs/simulation.md)
 - [HDMI 输入刷新率与 EDID](docs/hdmi.md)
 
 ## 文件结构
@@ -61,6 +62,7 @@ sudo ./yolo_app_26 --scores logits
 | --- | --- |
 | `make` / `make -j4` | 编译应用 |
 | `make test` | 运行回归测试 |
+| `make simulate` | 启动 HID／预判可视化调参仿真，默认每帧 20ms |
 | `make clean` | 清理编译产物 |
 | `make rebuild` | 清理后重新编译 |
 | `make package` | 生成发布包与校验文件 |

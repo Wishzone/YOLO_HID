@@ -19,6 +19,7 @@
 #include "modules/web_server.h"
 #include "modules/camera_capture.h"
 #include "modules/target_tracker.h"
+#include "modules/aim_controller.h"
 
 // --- Configuration ---
 #define MODEL_PATH "./Models/cs2-26n_rk3588_int8.rknn"
@@ -29,21 +30,9 @@
 #define MJPEG_QUALITY 80 
 
 // Control Parameters
-const float PID_KP = 0.60f;
-const float PID_KD = 0.35f;
-const float MOUSE_SENSITIVITY = 0.5f;
 const float HID_SMOOTH_FACTOR = 1.0f;
-const float AIM_DEADZONE = 0.0f; 
 const float AIM_HEIGHT_RATIO = 0.20f;
-const float AUTO_FIRE_RADIUS = 15.0f; 
 const int MAX_DETECTIONS = 100;
-
-// PID State
-struct {
-    float last_error_x = 0;
-    float last_error_y = 0;
-    int tracking_frames = 0;
-} pid_state;
 
 static bool parse_classes(const std::string& value, std::vector<int>& ids, const char* unrestricted) {
     ids.clear();
@@ -77,6 +66,7 @@ int main(int argc, char* argv[]) {
     TrackerOptions tracking_options;
     AimMode selected_mode = AimMode::Nearest;
     float hid_smoothing = HID_SMOOTH_FACTOR;
+    ControlOptions control_options;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "--help" || argument == "-h") {
@@ -85,6 +75,8 @@ int main(int argc, char* argv[]) {
                       << "  [--nms-iou VALUE] Raw-head duplicate suppression IoU, default 0.5 (0 < VALUE < 1).\n"
                       << "  [--aim-mode nearest|head-priority|head-only|body-only] [--head-classes none|0,1,...]\n"
                       << "  [--aim-radius PIXELS] [--prediction-ms 0..40] [--hid-smoothing 0.01..1]\n"
+                      << "  [--kp 0..5] [--kd 0..5] [--sensitivity 0.001..10] [--deadzone 0..100] [--aim-ratio 0..1]\n"
+                      << "PD defaults: kp=0.60 kd=0.35 sensitivity=0.5 deadzone=0 (per-frame gains).\n"
                       << "Defaults: nearest, no assumed head classes, full-frame radius, prediction off, smoothing 1.\n"
                       << "Default model: " << MODEL_PATH << "\n"
                       << "--check-model runs one NPU inference without camera, Web or HID.\n";
@@ -113,6 +105,13 @@ int main(int argc, char* argv[]) {
             const float minimum = argument == "--hid-smoothing" ? 0.01f : 0;
             const float maximum = argument == "--hid-smoothing" ? 1 : argument == "--prediction-ms" ? 40 : 100000;
             if (!parse_float(value,*destination,minimum,maximum)) { std::cerr << "Invalid " << argument << '\n'; return 2; }
+        } else if ((argument == "--kp" || argument == "--kd" || argument == "--sensitivity" || argument == "--deadzone" || argument == "--aim-ratio") && i + 1 < argc) {
+            float* destination = argument == "--kp" ? &control_options.kp : argument == "--kd" ? &control_options.kd :
+                                 argument == "--sensitivity" ? &control_options.sensitivity : argument == "--aim-ratio" ?
+                                 &tracking_options.body_aim_ratio : &control_options.deadzone;
+            const float minimum = argument == "--sensitivity" ? 0.001f : 0;
+            const float maximum = argument == "--deadzone" ? 100 : argument == "--sensitivity" ? 10 : argument == "--aim-ratio" ? 1 : 5;
+            if (!parse_float(argv[++i],*destination,minimum,maximum)) { std::cerr << "Invalid " << argument << '\n'; return 2; }
         } else if (argument == "--nms-iou" && i + 1 < argc) {
             const std::string value = argv[++i];
             try {
@@ -137,10 +136,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "This aim mode requires --head-classes from your model's labels\n"; return 2;
     }
     tracking_options.target_classes = target_classes;
-    tracking_options.body_aim_ratio = AIM_HEIGHT_RATIO;
     aim_mode = static_cast<int>(selected_mode);
     aim_head_classes_available = !tracking_options.head_classes.empty();
     TargetTracker tracker(tracking_options);
+    AimController controller(control_options);
     uint64_t last_control_revision = aim_settings_revision.load();
 
     std::cout << "[Control] Target classes:";
@@ -149,6 +148,8 @@ int main(int argc, char* argv[]) {
     std::cout << std::endl;
     std::cout << "[Control] Mode=" << aim_mode_name(selected_mode) << " radius=" << tracking_options.aim_radius
               << "px prediction=" << tracking_options.prediction_ms << "ms smoothing=" << hid_smoothing << std::endl;
+    std::cout << "[Control] Kp=" << control_options.kp << " Kd=" << control_options.kd
+              << " sensitivity=" << control_options.sensitivity << " deadzone=" << control_options.deadzone << std::endl;
 
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
     void* ctx = init_yolo26_model(model_path.c_str());
@@ -223,9 +224,6 @@ int main(int argc, char* argv[]) {
     int frame_count = 0;
     int exit_status = 0;
     
-    const float cx = camera_ctx.width / 2.0f;
-    const float cy = camera_ctx.height / 2.0f;
-
     // 预计算参数
     float r = std::min(640.0f/camera_ctx.height, 640.0f/camera_ctx.width);
     int nw = round(camera_ctx.width*r), nh = round(camera_ctx.height*r);
@@ -308,7 +306,7 @@ int main(int argc, char* argv[]) {
             std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
             static_cast<AimMode>(aim_mode.load()));
         if (target.changed || control_revision != last_control_revision) {
-            pid_state.tracking_frames = 0;
+            controller.reset();
             std::lock_guard<std::mutex> lock(hid_mutex);
             hid_buffer_x = hid_buffer_y = 0; fire_request = false;
             hid_cv.notify_one();
@@ -316,37 +314,19 @@ int main(int argc, char* argv[]) {
         last_control_revision = control_revision;
         hid_target_class = target.visible ? target.class_id : -1;
         if (target.visible && hid_enabled && hid_control_enabled) {
-            float raw_dx = target.x - cx;
-            float raw_dy = target.y - cy;
-            
-            if (std::abs(raw_dx) < AIM_DEADZONE) raw_dx = 0;
-            if (std::abs(raw_dy) < AIM_DEADZONE) raw_dy = 0;
-
-            // A new/reacquired target must not inherit another target's derivative.
-            float mx = (PID_KP * raw_dx) + (pid_state.tracking_frames ? PID_KD * (raw_dx - pid_state.last_error_x) : 0);
-            float my = (PID_KP * raw_dy) + (pid_state.tracking_frames ? PID_KD * (raw_dy - pid_state.last_error_y) : 0);
-            
-            pid_state.last_error_x = raw_dx; pid_state.last_error_y = raw_dy;
-            pid_state.tracking_frames++;
-            
-            float predicted_dist = std::sqrt(std::pow(raw_dx * (1.0f - PID_KP), 2) + std::pow(raw_dy * (1.0f - PID_KP), 2));
-            const float distance = std::hypot(raw_dx,raw_dy);
-            bool safe_to_predict = distance < (AUTO_FIRE_RADIUS * 2.5f);
-            bool should_fire = (distance < AUTO_FIRE_RADIUS) || (predicted_dist < AUTO_FIRE_RADIUS && safe_to_predict);
+            const AimControl control = controller.update(target,camera_ctx.width,camera_ctx.height);
 
             {
                 std::lock_guard<std::mutex> lock(hid_mutex);
                 if (hid_control_enabled && aim_settings_revision.load() == control_revision) {
-                    fire_request = should_fire;
-                    hid_buffer_x += mx * MOUSE_SENSITIVITY;
-                    hid_buffer_y += my * MOUSE_SENSITIVITY;
+                    fire_request = control.fire;
+                    hid_buffer_x += control.move_x;
+                    hid_buffer_y += control.move_y;
                 }
             }
             hid_cv.notify_one();
         } else {
-            pid_state.tracking_frames = 0;
-            pid_state.last_error_x = 0;
-            pid_state.last_error_y = 0;
+            controller.reset();
             {
                 std::lock_guard<std::mutex> lock(hid_mutex);
                 fire_request = false;

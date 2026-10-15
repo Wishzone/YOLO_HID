@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HID 与预判调参仿真</title>
+<style>
+:root{color-scheme:dark;font:14px system-ui,sans-serif;background:#10151e;color:#e4eaf4}*{box-sizing:border-box}body{margin:0}header{padding:20px 24px;border-bottom:1px solid #2b3648}h1{font-size:23px;margin:0 0 7px}p{margin:6px 0;color:#aab9ce;line-height:1.6}main{display:grid;grid-template-columns:330px minmax(0,1fr);gap:18px;max-width:1600px;margin:auto;padding:18px}fieldset,.panel{background:#18212e;border:1px solid #2b394f;border-radius:10px;padding:14px;margin:0 0 14px}legend{color:#80d3c3;font-weight:650}fieldset{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{font-size:12px;color:#aebed3;display:grid;gap:5px}input,select,button{font:inherit;border-radius:5px;border:1px solid #40536c;padding:7px;background:#111c2a;color:#edf3ff;min-width:0;width:100%}button{cursor:pointer;width:auto}button.primary{background:#277b70;border-color:#53b4a2;color:white}button:hover{filter:brightness(1.2)}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.wide{grid-column:1/-1}#error{color:#ff9999;white-space:pre-wrap}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{padding:13px;background:#18212e;border:1px solid #2b394f;border-radius:9px}.stat small{display:block;color:#aab9ce;font-size:12px}.stat strong{display:block;font-size:21px;margin-top:6px;color:#80d3c3}.stat span{font-size:12px;color:#9cadc4}.screen{margin-top:14px;padding:0;overflow:hidden}canvas{display:block;width:100%;height:auto}#scene{cursor:crosshair;background:#101822}#chart{background:#131d2a}.playback{padding:12px}#scrub{padding:0;width:100%}.muted{font-size:12px;color:#9cadc4}code{font:12px ui-monospace,monospace;word-break:break-all;color:#bfdfed}#detail{font:12px ui-monospace,monospace;line-height:1.8;white-space:pre-wrap}.check{display:flex;align-items:center;gap:6px}.check input{width:auto}.divider{margin-top:14px}.legend{display:flex;gap:18px;color:#aab9ce;font-size:12px;margin:8px 0}.green{color:#80d3c3}.yellow{color:#ffc778}.red{color:#f68f9f}.blue{color:#85b5ff}@media(max-width:1050px){main{grid-template-columns:280px minmax(0,1fr)}.stats{grid-template-columns:1fr 1fr}}@media(max-width:760px){main{display:flex;flex-direction:column}aside{order:2}.stats{grid-template-columns:1fr 1fr}header{padding:16px}h1{font-size:20px}}
+</style>
+<header><h1>HID 与预判调参仿真</h1><p>固定中心准星 · 复用实际 C++ PD、跟踪预判与 HID 整数拆分 · 默认 20ms / 帧</p></header>
+<main>
+<aside>
+<form id="settings">
+<fieldset><legend>控制参数</legend>
+<label>Kp<input name="kp" type="number" value="0.6" min="0" max="5" step="0.01" required></label>
+<label>Kd（每帧差分）<input name="kd" type="number" value="0.35" min="0" max="5" step="0.01" required></label>
+<label>鼠标倍率<input name="sensitivity" type="number" value="0.5" min="0.001" max="10" step="0.001" required></label>
+<label>HID 平滑系数<input name="hid-smoothing" type="number" value="1" min="0.01" max="1" step="0.01" required></label>
+<label>死区 / px<input name="deadzone" type="number" value="0" min="0" max="100" step="0.5" required></label>
+<label>预判提前量 / ms<input name="prediction-ms" type="number" value="0" min="0" max="40" step="1" required></label>
+<label>目标类型<select name="head"><option value="0">身体</option><option value="1">头部（框中心）</option></select></label>
+<label>身体瞄准高度<input name="aim-ratio" type="number" value="0.2" min="0" max="1" step="0.01" required></label>
+</fieldset>
+<fieldset><legend>目标与画面</legend>
+<label>画面宽<input name="width" type="number" value="1920" min="64" max="7680" step="1" required></label>
+<label>画面高<input name="height" type="number" value="1080" min="64" max="4320" step="1" required></label>
+<label>初始水平偏移 / px<input name="offset-x" type="number" value="300" step="1" required></label>
+<label>初始垂直偏移 / px<input name="offset-y" type="number" value="0" step="1" required></label>
+<label>目标框宽 / px<input name="box-width" type="number" value="80" min="1" step="1" required></label>
+<label>目标框高 / px<input name="box-height" type="number" value="120" min="1" step="1" required></label>
+<label>目标水平速度 / px/s<input name="vx" type="number" value="0" min="-5000" max="5000" step="1" required></label>
+<label>目标垂直速度 / px/s<input name="vy" type="number" value="0" min="-5000" max="5000" step="1" required></label>
+</fieldset>
+<fieldset><legend>时序与实机标定</legend>
+<label>每帧耗时 / ms<input name="frame-ms" type="number" value="20" min="1" max="100" step="0.1" required></label>
+<label>额外反馈延迟 / ms<input name="feedback-ms" type="number" value="0" min="0" max="500" step="1" required></label>
+<label>HID 报表间隔 / ms<input name="hid-interval-ms" type="number" value="1" min="0.25" max="20" step="0.25" required></label>
+<label>仿真总帧数<input name="frames" type="number" value="150" min="1" max="2000" step="1" required></label>
+<label>X 像素 / HID 单位<input name="gain-x" type="number" value="1" min="0.001" max="100" step="0.001" required></label>
+<label>Y 像素 / HID 单位<input name="gain-y" type="number" value="1" min="0.001" max="100" step="0.001" required></label>
+<label>连续入框帧数<input name="settle-frames" type="number" value="5" min="1" max="2001" step="1" required></label>
+<label>瞄准误差阈值 / px<input name="tolerance" type="number" value="2" min="0" max="100" step="0.5" required></label>
+</fieldset>
+<div class="actions"><button class="primary" id="run">运行仿真</button><button type="button" id="reset-defaults">恢复默认</button></div>
+<p id="error" role="alert"></p>
+</form>
+<div class="panel"><div class="actions"><button id="small">远处小目标</button><button id="moving">移动目标 + 延迟</button></div><p class="muted">也可点击画面设置目标的初始位置。</p><label class="check"><input type="checkbox" id="compare" checked> 对照预判关闭时的结果</label></div>
+<p class="muted">这里的控制器是 PD，没有积分项。改变帧率会改变实际每秒的差分作用。所有输出均为仿真，不连接 USB、摄像头或模型。</p>
+</aside>
+<section>
+<div class="stats">
+<div class="stat"><small>首次入框</small><strong id="entry">—</strong><span id="entry-time"></span></div>
+<div class="stat"><small id="stable-label">连续 5 帧入框的起始帧</small><strong id="stable">—</strong><span id="stable-time"></span></div>
+<div class="stat"><small>达到瞄准误差阈值</small><strong id="aim">—</strong><span id="aim-time"></span></div>
+<div class="stat"><small>最后 25 帧平均瞄准误差</small><strong id="tail">—</strong><span id="exits"></span></div>
+</div>
+<div class="panel screen"><canvas id="scene" width="1280" height="720" aria-label="目标框和固定准星的逐帧仿真"></canvas>
+<div class="playback"><div class="actions"><button id="play">播放</button><button id="prev">上一帧</button><button id="next">下一帧</button><select id="speed" style="width:auto"><option value="0.25">0.25× 慢放</option><option value="1" selected>1×</option><option value="2">2×</option></select><span id="frame-label"></span></div><input id="scrub" type="range" min="0" max="150" value="0" step="1" aria-label="回放帧"></div></div>
+<div class="legend"><span class="green">绿色：真实目标框</span><span class="yellow">黄色：延迟检测与预判瞄准点</span><span>白色：固定准星</span></div>
+<div class="panel"><div class="legend"><span class="blue">X 瞄准误差</span><span class="red">Y 瞄准误差</span><span>虚线：预判关闭对照</span></div><canvas id="chart" width="1280" height="260" aria-label="逐帧误差曲线"></canvas><p id="comparison" class="muted"></p></div>
+<div class="panel"><div id="detail"></div><div class="actions divider"><button id="csv">导出逐帧 CSV</button><button id="json">导出结果与参数 JSON</button><button id="copy">复制实机参数</button></div><p><code id="command"></code></p><p class="muted">实机参数只包含控制设置；请接上你的模型、类别等原有运行参数。头部模式还需配置实际模型的头部类别。</p></div>
+<p class="muted">帧 0 表示目标刚出现；第 N 帧为 N × 每帧耗时。入框与稳定性按帧末真实框统计，黄色点可能来自旧画面。预测沿用当前算法，包含准星自身移动引起的相对速度。HID 间隔和像素倍率需要实测，仿真不包含系统鼠标加速和识别误差。</p>
+</section>
+</main>
+<script>
+'use strict';
+const form=document.getElementById('settings'), scene=document.getElementById('scene'), chart=document.getElementById('chart');
+const byId=id=>document.getElementById(id);
+let result=null, baseline=null, index=0, playing=false, lastTime=null, generation=0;
+function parameters(){return new URLSearchParams(new FormData(form));}
+function setFields(values){for(const [key,value] of Object.entries(values)){const field=form.elements.namedItem(key);if(field)field.value=value;}}
+function stop(){playing=false;lastTime=null;byId('play').textContent='播放';}
+async function fetchResult(params){const response=await fetch('/api/simulate?'+params);if(!response.ok)throw Error(await response.text());return response.json();}
+async function run(){
+ if(!form.reportValidity())return;
+ const current=++generation;stop();byId('error').textContent='';byId('run').disabled=true;
+ const params=parameters(), plain=new URLSearchParams(params);plain.set('prediction-ms','0');
+ try{
+  const outputs=await Promise.all([fetchResult(params),byId('compare').checked&&Number(params.get('prediction-ms'))>0?fetchResult(plain):Promise.resolve(null)]);
+  if(current!==generation)return;
+  [result,baseline]=outputs;index=0;byId('scrub').max=result.trace.length-1;
+  for(const [key,name] of [['first_entry_frame','entry'],['settled_frame','stable'],['first_aim_frame','aim']]){
+   const frame=result.summary[key];byId(name).textContent=frame<0?'未达到':frame+' 帧';
+   byId(name+'-time').textContent=frame<0?'本次仿真时长内未达到':(frame*result.options['frame-ms']).toFixed(1)+' ms';
+  }
+  byId('stable-label').textContent='连续 '+result.options['settle-frames']+' 帧入框的起始帧';
+  byId('tail').textContent=result.summary.tail_error.toFixed(2)+' px';
+  byId('exits').textContent='移出 '+result.summary.exit_count+' 次 · 入框 '+(100*result.summary.inside_ratio).toFixed(1)+'%';
+  byId('command').textContent=result.runtime_command;
+  byId('comparison').textContent=baseline?'关闭预判：首次入框 '+frameText(baseline.summary.first_entry_frame)+'；末段平均误差 '+baseline.summary.tail_error.toFixed(2)+' px。当前预判：'+result.options['prediction-ms']+'ms。':'预判为 0 或对照已关闭。';
+  draw();
+ }catch(error){if(current===generation)byId('error').textContent=error.message;}
+ finally{if(current===generation)byId('run').disabled=false;}
+}
+function frameText(value){return value<0?'未达到':value+' 帧 / '+(value*result.options['frame-ms']).toFixed(1)+'ms';}
+function cross(ctx,x,y,color,size){ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(x-size,y);ctx.lineTo(x+size,y);ctx.moveTo(x,y-size);ctx.lineTo(x,y+size);ctx.stroke();}
+function draw(){
+ if(!result)return;
+ const row=result.trace[index], o=result.options, ctx=scene.getContext('2d'), w=scene.width,h=scene.height;
+ ctx.clearRect(0,0,w,h);ctx.fillStyle='#101822';ctx.fillRect(0,0,w,h);
+ const scale=Math.min(w/o.width,h/o.height),left=(w-o.width*scale)/2,top=(h-o.height*scale)/2;
+ ctx.save();ctx.beginPath();ctx.rect(left,top,o.width*scale,o.height*scale);ctx.clip();ctx.translate(left,top);ctx.scale(scale,scale);
+ ctx.lineWidth=1/scale;ctx.strokeStyle='#1c2b3c';ctx.beginPath();
+ for(let x=0;x<=o.width;x+=120){ctx.moveTo(x,0);ctx.lineTo(x,o.height);}for(let y=0;y<=o.height;y+=120){ctx.moveTo(0,y);ctx.lineTo(o.width,y);}ctx.stroke();
+ const box=row.box;ctx.lineWidth=2/scale;ctx.strokeStyle=row.inside?'#80d3c3':'#54a98a';ctx.fillStyle='#80d3c315';
+ ctx.fillRect(box[0],box[1],box[2]-box[0],box[3]-box[1]);ctx.strokeRect(box[0],box[1],box[2]-box[0],box[3]-box[1]);
+ cross(ctx,(box[0]+box[2])/2,box[1]+(box[3]-box[1])*(o.head?0.5:o['aim-ratio']),'#80d3c3',6/scale);
+ // Previous aim points in the current camera coordinate system.
+ ctx.strokeStyle='#80d3c360';ctx.lineWidth=1/scale;ctx.beginPath();
+ for(let i=Math.max(0,index-50);i<=index;i++){
+  const past=result.trace[i],x=o.width/2+o['offset-x']+o.vx*past.time_ms/1000-row.camera_x;
+  const y=o.height/2+o['offset-y']+o.vy*past.time_ms/1000-row.camera_y+(o.head?0:(o['aim-ratio']-0.5)*o['box-height']);
+  if(i===Math.max(0,index-50))ctx.moveTo(x,y);else ctx.lineTo(x,y);
+ }ctx.stroke();
+ if(row.visible){cross(ctx,row.target_x,row.target_y,'#ffc778',11/scale);ctx.strokeStyle='#ffc778';ctx.beginPath();ctx.arc(row.target_x,row.target_y,7/scale,0,2*Math.PI);ctx.stroke();}
+ cross(ctx,o.width/2,o.height/2,'#eef5ff',16/scale);ctx.restore();
+ ctx.font='18px system-ui';ctx.fillStyle=row.inside?'#80d3c3':'#c4d2e5';ctx.fillText(row.inside?'准星已入框':'准星在框外',18,30);
+ ctx.font='14px ui-monospace,monospace';ctx.fillStyle='#aab9ce';ctx.fillText('frame '+row.frame+'  |  '+row.time_ms.toFixed(1)+' ms',18,54);
+ byId('scrub').value=index;byId('frame-label').textContent=index+' / '+(result.trace.length-1)+' 帧 · '+row.time_ms.toFixed(1)+' ms';
+ byId('detail').textContent='真实瞄准误差 X/Y: '+row.error_x.toFixed(2)+' / '+row.error_y.toFixed(2)+' px\n'
+  +'本帧 HID 位移 X/Y: '+row.hid_dx+' / '+row.hid_dy+' counts · 报表 '+row.reports+' 份 · 总报表 '+result.summary.reports+' 份\n'
+  +'待发送缓存 X/Y: '+row.buffer_x.toFixed(3)+' / '+row.buffer_y.toFixed(3)+' · 跟踪编号 '+row.target_id+' · 可见 '+row.visible+'\n'
+  +'虚拟点击状态: '+(row.fire?'按下':'释放')+' · 框外按下帧数: '+result.summary.outside_fire_frames;
+ drawChart();
+}
+function drawChart(){
+ const ctx=chart.getContext('2d'),w=chart.width,h=chart.height,p=48;
+ ctx.clearRect(0,0,w,h);let max=5;
+ for(const data of [result,baseline])if(data)for(const row of data.trace)max=Math.max(max,Math.abs(row.error_x),Math.abs(row.error_y));
+ const x=i=>p+(w-p-16)*i/(result.trace.length-1),y=value=>h/2-value/max*(h/2-30);
+ ctx.strokeStyle='#344257';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p,20);ctx.lineTo(p,h-22);ctx.moveTo(p,h/2);ctx.lineTo(w-12,h/2);ctx.stroke();
+ ctx.font='12px system-ui';ctx.fillStyle='#aab9ce';ctx.fillText(Math.round(max)+'px',0,20);ctx.fillText('0',26,h/2+4);ctx.fillText('-'+Math.round(max),0,h-22);ctx.fillText('帧 0',p,h-4);ctx.fillText('帧 '+(result.trace.length-1),w-90,h-4);
+ for(const data of [baseline,result])if(data)for(const [key,color] of [['error_x','#85b5ff'],['error_y','#f68f9f']]){
+  ctx.setLineDash(data===baseline?[7,6]:[]);ctx.strokeStyle=color;ctx.globalAlpha=data===baseline?0.4:1;ctx.lineWidth=2;ctx.beginPath();
+  data.trace.forEach((row,i)=>i?ctx.lineTo(x(i),y(row[key])):ctx.moveTo(x(i),y(row[key])));ctx.stroke();
+ }
+ ctx.globalAlpha=1;ctx.setLineDash([]);ctx.strokeStyle='#e4eaf4';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x(index),20);ctx.lineTo(x(index),h-22);ctx.stroke();
+}
+function download(name,body,type){const url=URL.createObjectURL(new Blob([body],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+form.addEventListener('submit',event=>{event.preventDefault();run();});
+byId('reset-defaults').onclick=()=>{form.reset();run();};byId('compare').onchange=run;
+byId('small').onclick=()=>{form.reset();setFields({'offset-x':600,'offset-y':100,'box-width':30,'box-height':60});run();};
+byId('moving').onclick=()=>{form.reset();setFields({vx:160,'feedback-ms':20,'prediction-ms':20});run();};
+byId('play').onclick=()=>{if(!result)return;if(playing){stop();return;}if(index>=result.trace.length-1)index=0;playing=true;lastTime=null;byId('play').textContent='暂停';requestAnimationFrame(animate);};
+function animate(now){if(!playing)return;if(lastTime===null)lastTime=now;const interval=result.options['frame-ms']/Number(byId('speed').value),steps=Math.floor((now-lastTime)/interval);if(steps>0){index=Math.min(index+steps,result.trace.length-1);lastTime+=steps*interval;draw();}if(index>=result.trace.length-1)stop();else requestAnimationFrame(animate);}
+byId('prev').onclick=()=>{if(result){stop();index=Math.max(0,index-1);draw();}};
+byId('next').onclick=()=>{if(result){stop();index=Math.min(result.trace.length-1,index+1);draw();}};
+byId('scrub').oninput=event=>{if(result){stop();index=Number(event.target.value);draw();}};
+scene.onclick=event=>{if(!result)return;const rect=scene.getBoundingClientRect(),o=result.options,scale=Math.min(scene.width/o.width,scene.height/o.height);const x=((event.clientX-rect.left)*scene.width/rect.width-(scene.width-o.width*scale)/2)/scale;const y=((event.clientY-rect.top)*scene.height/rect.height-(scene.height-o.height*scale)/2)/scale;if(x<0||y<0||x>o.width||y>o.height)return;setFields({'offset-x':Math.round(x-o.width/2),'offset-y':Math.round(y-o.height/2)});run();};
+byId('csv').onclick=()=>{if(!result)return;const params=new URLSearchParams(result.options);params.set('format','csv');const a=document.createElement('a');a.href='/api/simulate?'+params;a.download='aim_trace.csv';a.click();};
+byId('json').onclick=()=>{if(result)download('aim_result.json',JSON.stringify(result,null,2),'application/json');};
+byId('copy').onclick=async()=>{if(!result)return;try{await navigator.clipboard.writeText(result.runtime_command);byId('copy').textContent='已复制';setTimeout(()=>byId('copy').textContent='复制实机参数',1500);}catch(error){const range=document.createRange();range.selectNodeContents(byId('command'));const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);byId('error').textContent='浏览器限制剪贴板，已选中参数，请按 Ctrl+C。';}};
+run();
+</script>
+</html>

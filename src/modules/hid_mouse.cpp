@@ -1,4 +1,5 @@
 #include "hid_mouse.h"
+#include "hid_motion.h"
 #include "../core/globals.h"
 #include <iostream>
 #include <fcntl.h>
@@ -82,16 +83,10 @@ void hid_worker(float smooth_factor) {
         if (poll(&pfd, 1, 10) <= 0) continue;
         lock.lock();
 
-        auto step = [smoothing](float value) {
-            if (std::abs(value) <= 0.5f) return 0;
-            float amount = value * smoothing;
-            if (std::abs(amount) < 1.0f) amount = value > 0 ? 1.0f : -1.0f;
-            return static_cast<int>(std::max(-127.0f, std::min(127.0f, amount)));
-        };
         const bool can_move = !initial_release && hid_control_enabled.load();
         const bool current_fire = can_move && fire_request.load();
-        const int dx = can_move ? step(hid_buffer_x) : 0;
-        const int dy = can_move ? step(hid_buffer_y) : 0;
+        const int dx = can_move ? hid_axis_step(hid_buffer_x,smoothing) : 0;
+        const int dy = can_move ? hid_axis_step(hid_buffer_y,smoothing) : 0;
         const uint8_t report[] = {static_cast<uint8_t>(current_fire ? 1 : 0),
                                  static_cast<uint8_t>(dx), static_cast<uint8_t>(dy), 0};
         const ssize_t written = write(hid_fd, report, sizeof(report));

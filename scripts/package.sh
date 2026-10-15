@@ -23,7 +23,7 @@ cp -R docs "$stage/$name/"
 while IFS= read -r -d '' source; do
     mkdir -p "$stage/$name/$(dirname "$source")"
     cp "$source" "$stage/$name/$source"
-done < <(find src tools scripts tests -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.py' -o -name '*.sh' -o -name Makefile \) -print0)
+done < <(find src tools scripts tests -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.py' -o -name '*.html' -o -name '*.sh' -o -name Makefile \) -print0)
 printf '%s\n' "$version" > "$stage/$name/BUILD_COMMIT"
 tar -C "$stage" -czf "dist/$name.tar.gz" "$name"
 (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
